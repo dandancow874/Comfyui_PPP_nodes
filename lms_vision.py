@@ -150,7 +150,7 @@ class LMS_VisionController:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("response_text",)
     FUNCTION = "generate_content"
-    CATEGORY = "LM Studio/VLM"
+    CATEGORY = "PPP/LM Studio"
 
     def process_image(self, tensor_img, max_side):
         try:
@@ -275,5 +275,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LMS_VisionController": "LM Studio VLM (Final Fixed)"
+    "LMS_VisionController": "LM Studio VLM"
 }
