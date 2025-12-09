@@ -1,2 +1,6 @@
+torch
+numpy
+Pillow
+json5
 requests>=2.25.0
 Pillow>=9.0.0
