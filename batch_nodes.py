@@ -28,7 +28,7 @@ class BatchImageLoaderRecursive:
     OUTPUT_IS_LIST = (True, True, True, True, True)
     
     FUNCTION = "load_images"
-    CATEGORY = "PPP/Batch Walker"
+    CATEGORY = "PPP_nodes/Batch Walker"
 
     # 强制每次运行都检查文件夹变化
     @classmethod
@@ -132,7 +132,7 @@ class BatchImageSaverRecursive:
     RETURN_TYPES = ()
     FUNCTION = "save_images"
     OUTPUT_NODE = True
-    CATEGORY = "PPP/Batch Walker"
+    CATEGORY = "PPP_nodes/Batch Walker"
     
     # 设为 False 以流式处理（每处理完一张保存一张）
     INPUT_IS_LIST = False 
@@ -234,7 +234,7 @@ class BatchTextSaverRecursive:
     RETURN_TYPES = ()
     FUNCTION = "save_text"
     OUTPUT_NODE = True
-    CATEGORY = "PPP/Batch Walker"
+    CATEGORY = "PPP_nodes/Batch Walker"
     INPUT_IS_LIST = False 
 
     def save_text(self, text_data, file_parent_folders, filenames, original_root_ref, output_root, extension, filename_suffix, collision_mode):
@@ -310,8 +310,10 @@ class BatchImageLoaderByIndex:
             "required": {
                 "folder_path": ("STRING", {"default": "C:\\path\\to\\images"}),
                 "extensions": ("STRING", {"default": "", "multiline": False, "placeholder": "e.g. .png,.jpg"}),
-                # 🟢 核心修改：为了让 ComfyUI 显示递增按钮，必须把名字改成 "seed"
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                # index (起始索引)
+                "index": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1, "label": "Start Index"}),
+                # seed (步进/增量)
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1, "label": "Stepper (Auto)"}),
             },
             "optional": {
                 "batch_limit": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}), 
@@ -322,15 +324,15 @@ class BatchImageLoaderByIndex:
     RETURN_NAMES = ("image", "mask", "file_parent_folder", "filename", "original_root_ref", "file_count")
     OUTPUT_IS_LIST = (False, False, False, False, False, False)
     FUNCTION = "load_image_by_index"
-    CATEGORY = "PPP/Batch Walker"
+    CATEGORY = "Batch Walker"
 
     @classmethod
-    def IS_CHANGED(s, folder_path, extensions, seed, batch_limit):
+    def IS_CHANGED(s, folder_path, extensions, index, seed, batch_limit):
         return float("NaN")
 
-    def load_image_by_index(self, folder_path, extensions, seed, batch_limit):
-        # 🟢 内部逻辑：把 seed 当作 index 使用
-        index = seed
+    def load_image_by_index(self, folder_path, extensions, index, seed, batch_limit):
+        # 索引计算
+        real_index = index + seed
         
         if not os.path.isdir(folder_path):
             raise FileNotFoundError(f"Directory not found: {folder_path}")
@@ -358,7 +360,7 @@ class BatchImageLoaderByIndex:
 
         if batch_limit > 0:
             image_paths = image_paths[:batch_limit]
-            if index == 0:
+            if real_index == 0:
                 print(f"BatchLoader: Limit active. Pool size: {len(image_paths)}")
 
         total_count = len(image_paths)
@@ -370,10 +372,10 @@ class BatchImageLoaderByIndex:
             return (empty_img, empty_mask, "", "", "", 0)
 
         # 取模循环
-        safe_index = index % total_count
+        safe_index = real_index % total_count
         
         target_path = image_paths[safe_index]
-        print(f"BatchLoader (Index {index}): Loading {safe_index + 1}/{total_count} -> {os.path.basename(target_path)}")
+        print(f"BatchLoader (Pos {real_index}): Loading {safe_index + 1}/{total_count} -> {os.path.basename(target_path)}")
 
         try:
             img = Image.open(target_path)
@@ -399,8 +401,13 @@ class BatchImageLoaderByIndex:
 
         except Exception as e:
             print(f"Error loading {target_path}: {e}")
+            # --- 修复点在这里 ---
+            # 创建一个空的 mask (1x64x64)
             empty_img = torch.zeros((1, 64, 64, 3), dtype=torch.float32, device="cpu")
-            return (empty_img, mask, "", "", "", total_count)
+            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32, device="cpu")
+            
+            # 返回 empty_mask 而不是未定义的 mask
+            return (empty_img, empty_mask, "", "", "", total_count)
 
 NODE_CLASS_MAPPINGS = {
     "BatchImageLoaderRecursive": BatchImageLoaderRecursive,
