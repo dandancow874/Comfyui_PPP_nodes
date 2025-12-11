@@ -13,14 +13,16 @@ import time
 logger = logging.getLogger("LMS_Controller")
 
 class LMS_CLI_Handler:
-    # ... (保持之前的 CLI Handler 代码不变，为了节省篇幅这里省略，请保留原有的这部分) ...
-    # 只需要替换下方的 LMS_VisionController 类
+    """
+    负责与 LM Studio 命令行交互 (跨平台兼容版)
+    """
     _model_cache = None
     _last_cache_time = 0
     CACHE_TTL = 10 
 
     @staticmethod
     def get_lms_path():
+        # --- Windows 逻辑 ---
         if os.name == 'nt':
             user_home = os.path.expanduser("~")
             candidates = [
@@ -30,13 +32,22 @@ class LMS_CLI_Handler:
             for path in candidates:
                 if os.path.exists(path):
                     return path
-        return "lms"
+            return "lms" # 如果找不到路径，尝试直接调用命令
+        
+        # --- Mac/Linux 逻辑 ---
+        else:
+            # 在 Mac 上，只要用户点了 "Install lms to PATH"，直接用 lms 即可
+            # 也可以检查一下默认路径作为兜底
+            return "lms"
 
     @staticmethod
     def run_cmd(args, timeout=30):
         lms_path = LMS_CLI_Handler.get_lms_path()
         cmd = [lms_path] + args
+        
         startupinfo = None
+        # [关键修复] 只有 Windows 才需要配置 startupinfo 来隐藏黑框
+        # Mac/Linux 不需要这个，加了反而会报错
         if os.name == 'nt':
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -50,7 +61,7 @@ class LMS_CLI_Handler:
                 timeout=timeout,
                 encoding='utf-8',
                 errors='replace',
-                startupinfo=startupinfo
+                startupinfo=startupinfo # Mac下这是 None，不会报错
             )
             return result.returncode == 0, result.stdout, result.stderr
         except Exception as e:
@@ -58,6 +69,8 @@ class LMS_CLI_Handler:
 
     @classmethod
     def get_models(cls):
+        # ... (get_models 的内容保持不变，直接复制之前的即可) ...
+        # 为了节省篇幅，这里假设你保留了之前修正好的 get_models 代码
         if cls._model_cache and (time.time() - cls._last_cache_time < cls.CACHE_TTL):
             return cls._model_cache
 
@@ -97,6 +110,7 @@ class LMS_CLI_Handler:
 
     @classmethod
     def load_model(cls, model_name, identifier, gpu_ratio=1.0, context_length=2048):
+        # ... (load_model 保持不变) ...
         logger.info(f"LMS: Loading '{model_name}' (GPU: {gpu_ratio}, Ctx: {context_length})...")
         gpu_arg = "max" if gpu_ratio >= 1.0 else str(gpu_ratio)
         if gpu_ratio <= 0: gpu_arg = "0"
@@ -107,9 +121,9 @@ class LMS_CLI_Handler:
 
     @classmethod
     def unload_all(cls):
+        # ... (unload_all 保持不变) ...
         success, _, stderr = cls.run_cmd(["unload", "--all"], timeout=20)
         return success
-
 
 class LMS_VisionController:
     _current_loaded_model = None 
