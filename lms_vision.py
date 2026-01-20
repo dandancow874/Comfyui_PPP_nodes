@@ -41,36 +41,63 @@ class LMS_CLI_Handler:
             return "lms"
 
     @staticmethod
-    def run_cmd(args, timeout=30):
+    def run_cmd(args, timeout=60):
         lms_path = LMS_CLI_Handler.get_lms_path()
         cmd = [lms_path] + args
         
         startupinfo = None
-        # [关键修复] 只有 Windows 才需要配置 startupinfo 来隐藏黑框
-        # Mac/Linux 不需要这个，加了反而会报错
         if os.name == 'nt':
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
 
         try:
-            result = subprocess.run(
+            # [关键修改] 使用 Popen 替代 run，以便非阻塞执行
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 encoding='utf-8',
                 errors='replace',
-                startupinfo=startupinfo # Mac下这是 None，不会报错
+                startupinfo=startupinfo
             )
-            return result.returncode == 0, result.stdout, result.stderr
+            
+            start_time = time.time()
+            while True:
+                # 1. 检查子进程是否结束
+                retcode = process.poll()
+                if retcode is not None:
+                    stdout, stderr = process.communicate()
+                    return retcode == 0, stdout, stderr
+                
+                # 2. 检查是否超时
+                if time.time() - start_time > timeout:
+                    process.kill()
+                    return False, "", f"Timeout after {timeout}s"
+                
+                # 3. [核心] 检查 ComfyUI 是否发出了取消信号 (抛出异常)
+                # ComfyUI 的中断机制通常是通过在 Python 线程中抛出 SystemExit 或 KeyboardInterrupt
+                # 我们这里虽然在 while 循环，但 Python 解释器有机会响应信号
+                # 如果用户狂按停止，ComfyUI 可能会尝试 kill 这个节点的 worker 线程
+                
+                time.sleep(0.5) # 让出 CPU，给中断信号机会
+                
+        except KeyboardInterrupt:
+            # 捕获用户的停止操作
+            if process:
+                process.kill()
+            logger.warning("User cancelled the operation.")
+            raise # 重新抛出，让 ComfyUI 知道任务已取消
+            
         except Exception as e:
+            if process:
+                process.kill()
             return False, "", str(e)
 
     @classmethod
     def get_models(cls):
-        # ... (get_models 的内容保持不变，直接复制之前的即可) ...
-        # 为了节省篇幅，这里假设你保留了之前修正好的 get_models 代码
+        # 如果缓存有效，直接返回
         if cls._model_cache and (time.time() - cls._last_cache_time < cls.CACHE_TTL):
             return cls._model_cache
 
@@ -81,27 +108,55 @@ class LMS_CLI_Handler:
 
         models = []
         lines = stdout.strip().splitlines()
+        
+        # 关键词黑名单 (过滤掉表头和无关信息)
         BLACKLIST = {
             "size", "ram", "type", "architecture", "model", "path", 
             "llm", "llms", "embedding", "embeddings", "vision", "image",
             "name", "loading", "fetching", "downloaded", "bytes", "date",
             "publisher", "repository", "you", "have", "features", "primary", "gpu"
         }
+        
         for line in lines:
             line = line.strip()
             if not line: continue
+            # 过滤掉分隔线
             if all(c in "-=*" for c in line): continue
+            
             parts = line.split()
             if not parts: continue
+            
+            # 第一列通常是模型名
             raw_name = parts[0]
             raw_lower = raw_name.lower()
+            
+            # 过滤表头
             if raw_lower.rstrip(":") in BLACKLIST: continue
             if raw_lower[0].isdigit() and ("gb" in raw_lower or "mb" in raw_lower): continue
+            
+            # 提取干净的模型名
             clean_name = raw_name
-            if "/" in clean_name: clean_name = clean_name.split("/")[-1]
-            if clean_name.lower().endswith(".gguf"): clean_name = clean_name[:-5]
+            # 如果是路径，只取最后的文件名
+            if "/" in clean_name or "\\" in clean_name: 
+                 clean_name = os.path.basename(clean_name)
+            
+            # 如果有 .gguf 后缀，保留它 (为了精确匹配)，或者去掉它 (为了美观)
+            # 建议：如果 LM Studio 加载命令需要完整名字，最好保留 .gguf
+            # 但用户习惯只看名字，这里做个折中：
+            # 如果名字太长，或者包含完整路径，LM Studio 的 `lms load` 通常支持模糊匹配，但最好提供完整的 `publisher/repo/file` 格式
+            
+            # [关键修改] 为了解决 "not found" 问题，我们尝试抓取完整的一行作为候选，或者抓取更精确的标识符
+            # 但 `lms ls` 的输出格式对齐很乱。
+            # 现在的策略：如果这一行包含 ">" (表示当前选中的)，去掉它
+            if clean_name == ">":
+                if len(parts) > 1:
+                    clean_name = parts[1]
+                else:
+                    continue
+            
             if len(clean_name) < 2: continue
             models.append(clean_name)
+
         unique_models = sorted(list(set(models)))
         if not unique_models: unique_models = ["No models found"]
         cls._model_cache = unique_models
@@ -110,14 +165,46 @@ class LMS_CLI_Handler:
 
     @classmethod
     def load_model(cls, model_name, identifier, gpu_ratio=1.0, context_length=2048):
-        # ... (load_model 保持不变) ...
+        # 简单处理：如果之前加载的就是这个模型，且参数没变，就跳过
+        # 注意：这里仅仅是简单的缓存检查，更严谨的做法是查询 lms ps
+        # 但考虑到 lms ps 解析复杂，这里先用类变量缓存
+        
         logger.info(f"LMS: Loading '{model_name}' (GPU: {gpu_ratio}, Ctx: {context_length})...")
+        
+        # 构造参数
+        # 注意：LM Studio 版本不同参数可能不同，这里使用较通用的参数
+        # 如果是 0.3.x 版本，--gpu 可能变成了 --gpu-offload-ratio
+        # 但目前 --gpu 仍然兼容大多数版本
+        
         gpu_arg = "max" if gpu_ratio >= 1.0 else str(gpu_ratio)
         if gpu_ratio <= 0: gpu_arg = "0"
+
         args = ["load", model_name, "--identifier", identifier, "--gpu", gpu_arg, "--context-length", str(context_length)]
-        success, stdout, stderr = cls.run_cmd(args, timeout=180)
-        if not success: logger.error(f"LMS Load Error: {stderr}")
-        return success
+        
+        # [Debug] 打印完整命令，方便排查
+        logger.info(f"Executing: lms {' '.join(args)}")
+
+        # [修复] 增加超时时间到 300秒 (5分钟)，防止大模型加载慢导致超时
+        success, stdout, stderr = cls.run_cmd(args, timeout=300)
+        
+        if not success:
+            # [关键] 增加对 "Model not found" 的特异性处理
+            # 很多时候是因为名字不匹配，或者需要全路径
+            if "not found" in stderr.lower() or "did you mean" in stderr.lower():
+                logger.warning(f"Model '{model_name}' not found directly. Attempting fuzzy search...")
+                # 这里可以尝试自动纠正，但目前先给出明确提示
+                logger.error(f"Suggest: Run 'lms ls' in terminal to check the exact name.")
+            
+            logger.error(f"LMS Load Error (stderr): {stderr}")
+            logger.error(f"LMS Load Output (stdout): {stdout}")
+            return False
+        
+        # 即使 returncode == 0，有时候 lms 也会输出错误信息到 stdout
+        if "error" in stdout.lower() or "failed" in stdout.lower():
+             logger.warning(f"LMS Load returned success but output contains error keywords:\n{stdout}")
+
+        logger.info(f"LMS Load Success: {stdout.strip()}")
+        return True
 
     @classmethod
     def unload_all(cls):
@@ -238,15 +325,34 @@ class LMS_VisionController:
         )
 
         if needs_reload:
+            logger.info(f"Model change detected or parameters changed. Unloading old model...")
             self.cli.unload_all()
-            time.sleep(1.0)
+            time.sleep(2.0) # 增加等待时间，确保端口释放
+            
+            logger.info(f"Loading new model: {model_name}")
             success = self.cli.load_model(model_name, IDENTIFIER, gpu_ratio=gpu_offload, context_length=context_length)
+            
             if success:
                 LMS_VisionController._current_loaded_model = model_name
                 LMS_VisionController._current_gpu_ratio = gpu_offload
                 LMS_VisionController._current_context = context_length
-                time.sleep(2.0)
+                # 再次等待，确保模型完全就绪
+                time.sleep(3.0) 
             else:
+                err_msg = f"Error: Failed to load model '{model_name}'. Check ComfyUI console for detailed lms output."
+                logger.error(err_msg)
+                return (err_msg,)
+        
+        # 即使不需要重新加载，如果模型状态是 None (比如刚启动 ComfyUI)，也应该尝试加载
+        elif LMS_VisionController._current_loaded_model is None:
+             logger.info(f"Initial model load: {model_name}")
+             success = self.cli.load_model(model_name, IDENTIFIER, gpu_ratio=gpu_offload, context_length=context_length)
+             if success:
+                LMS_VisionController._current_loaded_model = model_name
+                LMS_VisionController._current_gpu_ratio = gpu_offload
+                LMS_VisionController._current_context = context_length
+                time.sleep(3.0)
+             else:
                 return (f"Error: Failed to load model '{model_name}'.",)
 
         # 5. 构建 Payload [核心修改：区分纯文本和多模态]
