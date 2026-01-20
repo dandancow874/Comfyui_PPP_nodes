@@ -69,41 +69,68 @@ class LMS_CLI_Handler:
 
     @classmethod
     def get_models(cls):
-        # ... (get_models 的内容保持不变，直接复制之前的即可) ...
-        # 为了节省篇幅，这里假设你保留了之前修正好的 get_models 代码
+        # 缓存机制：如果缓存存在且未过期 (10秒内)，直接返回缓存
         if cls._model_cache and (time.time() - cls._last_cache_time < cls.CACHE_TTL):
             return cls._model_cache
 
-        success, stdout, stderr = cls.run_cmd(["ls"], timeout=5)
-        if not success:
-            logger.error(f"LMS LS Error: {stderr}")
-            return ["Error: lms ls failed"]
-
+        # 尝试使用 JSON 格式获取模型列表 (更准确)
+        success, stdout, stderr = cls.run_cmd(["ls", "--json"], timeout=10)
+        
         models = []
-        lines = stdout.strip().splitlines()
-        BLACKLIST = {
-            "size", "ram", "type", "architecture", "model", "path", 
-            "llm", "llms", "embedding", "embeddings", "vision", "image",
-            "name", "loading", "fetching", "downloaded", "bytes", "date",
-            "publisher", "repository", "you", "have", "features", "primary", "gpu"
-        }
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            if all(c in "-=*" for c in line): continue
-            parts = line.split()
-            if not parts: continue
-            raw_name = parts[0]
-            raw_lower = raw_name.lower()
-            if raw_lower.rstrip(":") in BLACKLIST: continue
-            if raw_lower[0].isdigit() and ("gb" in raw_lower or "mb" in raw_lower): continue
-            clean_name = raw_name
-            if "/" in clean_name: clean_name = clean_name.split("/")[-1]
-            if clean_name.lower().endswith(".gguf"): clean_name = clean_name[:-5]
-            if len(clean_name) < 2: continue
-            models.append(clean_name)
+        
+        if success:
+            try:
+                # 尝试解析 JSON
+                data = json.loads(stdout)
+                for item in data:
+                    # 优先使用 path，其次是 modelKey
+                    # 注意：lms load 命令通常接受 path 或 modelKey
+                    model_path = item.get("path") or item.get("modelKey")
+                    if model_path:
+                        # 如果 path 是 "qwen/qwen3-vl-4b"，我们保留它
+                        # 如果 path 是 "publisher/repo/file.gguf"，我们也保留它
+                        # 只有当它是 .gguf 结尾时，我们才去掉后缀，为了显示美观
+                        if model_path.lower().endswith(".gguf"):
+                             model_path = model_path[:-5]
+                        
+                        models.append(model_path)
+            except json.JSONDecodeError:
+                logger.warning("LMS: Failed to parse 'lms ls --json', falling back to text parsing.")
+                success = False # 标记为失败，以便回退到文本解析
+
+        # 如果 JSON 解析失败，回退到原来的文本解析逻辑
+        if not success or not models:
+            success, stdout, stderr = cls.run_cmd(["ls"], timeout=5)
+            if not success:
+                logger.error(f"LMS LS Error: {stderr}")
+                return ["Error: lms ls failed"]
+
+            lines = stdout.strip().splitlines()
+            BLACKLIST = {
+                "size", "ram", "type", "architecture", "model", "path", 
+                "llm", "llms", "embedding", "embeddings", "vision", "image",
+                "name", "loading", "fetching", "downloaded", "bytes", "date",
+                "publisher", "repository", "you", "have", "features", "primary", "gpu"
+            }
+            for line in lines:
+                line = line.strip()
+                if not line: continue
+                if all(c in "-=*" for c in line): continue
+                parts = line.split()
+                if not parts: continue
+                raw_name = parts[0]
+                raw_lower = raw_name.lower()
+                if raw_lower.rstrip(":") in BLACKLIST: continue
+                if raw_lower[0].isdigit() and ("gb" in raw_lower or "mb" in raw_lower): continue
+                clean_name = raw_name
+                # if "/" in clean_name: clean_name = clean_name.split("/")[-1] # 已注释，保留完整路径
+                if clean_name.lower().endswith(".gguf"): clean_name = clean_name[:-5]
+                if len(clean_name) < 2: continue
+                models.append(clean_name)
+
         unique_models = sorted(list(set(models)))
         if not unique_models: unique_models = ["No models found"]
+        
         cls._model_cache = unique_models
         cls._last_cache_time = time.time()
         return unique_models
@@ -114,7 +141,10 @@ class LMS_CLI_Handler:
         logger.info(f"LMS: Loading '{model_name}' (GPU: {gpu_ratio}, Ctx: {context_length})...")
         gpu_arg = "max" if gpu_ratio >= 1.0 else str(gpu_ratio)
         if gpu_ratio <= 0: gpu_arg = "0"
-        args = ["load", model_name, "--identifier", identifier, "--gpu", gpu_arg, "--context-length", str(context_length)]
+        
+        # [核心修复] 添加 -y 参数，自动确认/选择第一个匹配项，防止交互式卡死
+        args = ["load", model_name, "--identifier", identifier, "--gpu", gpu_arg, "--context-length", str(context_length), "-y"]
+        
         success, stdout, stderr = cls.run_cmd(args, timeout=180)
         if not success: logger.error(f"LMS Load Error: {stderr}")
         return success
