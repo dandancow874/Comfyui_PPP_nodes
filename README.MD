@@ -16,6 +16,7 @@
 *   **参数全掌控**：支持调节 Temperature, Top P, Top K, 重复惩罚 (Repetition Penalty) 等参数。
 *   **CLI 深度集成**：通过 `lms ls` 自动获取你本地下载的所有模型列表。
 *   **列表自动清洗**：自动过滤掉无关的系统文本，只显示清晰的模型名称。
+*   **手动/自动模式切换**：新增 `Manual (Use Currently Loaded)` 模式。针对 Qwen2.5-VL 等复杂模型，可选择跳过 CLI 自动加载，直接使用 LM Studio GUI 中已手动加载好的模型，彻底解决模型兼容性问题。
 
 ### ⚙️ 前置要求 (重要)
 
@@ -35,7 +36,10 @@
 1.  在 ComfyUI 中搜索节点 **"LM Studio Vision Controller"**。
 2.  连接图像 (Image) 和提示词 (Prompt)。
 3.  **Model Name**: 从下拉菜单中选择一个视觉模型（列表会自动同步 LM Studio 中已下载的模型）。
-4.  **Unload After**: 如果你的显存紧张，建议开启此选项，它会在任务完成后自动卸载模型。
+4.  **Load Mode**: 
+    *   `Auto (Reload)`: (默认) 自动通过命令行加载模型。
+    *   `Manual (Use Currently Loaded)`: **推荐用于复杂模型**。在 LM Studio 软件界面手动加载模型（确保 Vision Adapter 正确挂载），然后在 ComfyUI 中直接运行。
+5.  **Unload After**: 如果你的显存紧张，建议开启此选项，它会在任务完成后自动卸载模型。
 
 
 ## Batch Walker
