@@ -141,7 +141,6 @@ class LMS_VisionController:
                 # [修改点1] image 已经移到了 optional，这里只保留其他必填项
                 "user_prompt": ("STRING", {"multiline": True, "default": "Describe the content of the images/video."}),
                 "model_name": (model_list,),
-                "load_mode": (["Auto (Reload)", "Manual (Use Currently Loaded)"], {"default": "Auto (Reload)"}),
                 "max_total_images": ("INT", {"default": 8, "min": 1, "max": 64}),
                 "gpu_offload": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "context_length": ("INT", {"default": 8192, "min": 512, "max": 32768}),
@@ -185,40 +184,13 @@ class LMS_VisionController:
             logger.error(f"Image processing error: {e}")
             return None
 
-    def generate_content(self, user_prompt, model_name, load_mode, max_total_images, gpu_offload, context_length, max_image_side,
+    def generate_content(self, user_prompt, model_name, max_total_images, gpu_offload, context_length, max_image_side,
                          max_tokens, temperature, seed, unload_after, 
                          image=None, image_2=None, image_3=None, video_frames=None,
                          system_prompt="", base_url="http://localhost:1234/v1", **kwargs):
         
         if "http" not in base_url: base_url = "http://localhost:1234/v1"
         IDENTIFIER = "comfy_vlm_worker"
-        
-        # 0. 模型加载逻辑 (核心修改)
-        # 如果是 Manual 模式，完全跳过 CLI 操作，假设用户已经在 GUI 中配置好了模型
-        if load_mode == "Auto (Reload)":
-            # 只有当模型名变了，或者之前没加载过，才执行重载
-            needs_reload = (LMS_VisionController._current_loaded_model != model_name)
-            
-            if needs_reload:
-                cli = LMS_CLI_Handler()
-                # 尝试卸载之前的 (如果不匹配)
-                if LMS_VisionController._current_loaded_model is not None:
-                    logger.info(f"Unloading previous model: {LMS_VisionController._current_loaded_model}")
-                    cli.unload_all()
-                
-                # 加载新模型
-                logger.info(f"Auto-loading model via CLI: {model_name}")
-                success = cli.load_model(model_name, identifier=IDENTIFIER, gpu_offload=gpu_offload, context_length=context_length)
-                
-                if success:
-                    LMS_VisionController._current_loaded_model = model_name
-                else:
-                    logger.error(f"Failed to load model {model_name}. Attempting to proceed anyway (maybe loaded manually?).")
-            else:
-                logger.info(f"Model {model_name} already loaded. Skipping reload.")
-        else:
-            logger.info("Manual load mode selected. Skipping CLI model loading. Using whatever is running in LM Studio.")
-            # 在手动模式下，我们不更新 _current_loaded_model，以免干扰自动模式的状态逻辑
         
         # 1. 收集图片
         all_tensors = []
