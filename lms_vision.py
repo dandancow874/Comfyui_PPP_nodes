@@ -177,7 +177,8 @@ class LMS_VisionController:
                 new_size = (int(width * ratio), int(height * ratio))
                 pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
             buffer = io.BytesIO()
-            pil_img.save(buffer, format="JPEG", quality=85)
+            # 改为 PNG 以获得更好的兼容性，虽然体积稍大
+            pil_img.save(buffer, format="PNG")
             return base64.b64encode(buffer.getvalue()).decode('utf-8')
         except Exception as e:
             logger.error(f"Image processing error: {e}")
@@ -227,7 +228,10 @@ class LMS_VisionController:
                 if b64:
                     image_content_list.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}",
+                            "detail": "auto" # 显式添加 detail 参数
+                        }
                     })
 
         # 4. 加载模型 (保持不变)
