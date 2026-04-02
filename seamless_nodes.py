@@ -1,0 +1,332 @@
+import torch
+import numpy as np
+from PIL import Image, ImageOps, ImageFilter
+
+
+class SeamlessCrossMaskGenerator:
+    """
+    将图片变成2x2拼图，并从中心创建十字蒙版用于拼图中间的接缝
+
+    输入：图片（可选）
+    输出：2x2拼图图片，十字蒙版
+
+    菜单选项：
+    - mask大小：十字蒙版的宽度（像素）
+    - Mask Blur：蒙版模糊程度（像素）
+    - 2x2拼图：开关，是否生成拼图图片
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask_size": (
+                    "INT",
+                    {
+                        "default": 100,
+                        "min": 10,
+                        "max": 500,
+                        "step": 10,
+                        "label": "Mask Size (px)",
+                    },
+                ),
+                "mask_blur": (
+                    "INT",
+                    {
+                        "default": 10,
+                        "min": 0,
+                        "max": 100,
+                        "step": 1,
+                        "label": "Mask Blur (px)",
+                    },
+                ),
+                "create_2x2_puzzle": (
+                    "BOOLEAN",
+                    {"default": True, "label": "Create 2x2 Puzzle"},
+                ),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "generate_cross_mask"
+    CATEGORY = "PPP_nodes/Seamless Patch"
+
+    def generate_cross_mask(self, mask_size, mask_blur, create_2x2_puzzle, image=None):
+        # 确定输出尺寸
+        if image is not None and create_2x2_puzzle:
+            # 图片尺寸
+            h, w, c = image.shape
+            output_h, output_w = h, w
+        else:
+            # 默认尺寸
+            output_h, output_w = 1024, 1024
+
+        # 生成十字蒙版
+        mask = np.zeros((output_h, output_w), dtype=np.float32)
+
+        # 计算十字位置
+        center_y, center_x = output_h // 2, output_w // 2
+        half_size = mask_size // 2
+
+        # 绘制十字
+        # 水平条
+        y1 = center_y - half_size
+        y2 = center_y + half_size
+        mask[y1:y2, :] = 1.0
+
+        # 垂直条
+        x1 = center_x - half_size
+        x2 = center_x + half_size
+        mask[:, x1:x2] = 1.0
+
+        # 模糊处理
+        if mask_blur > 0:
+            mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+            mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(radius=mask_blur))
+            mask = np.array(mask_pil).astype(np.float32) / 255.0
+
+        # 处理图片输出
+        if image is not None and create_2x2_puzzle:
+            # 创建2x2拼图
+            img_np = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_pil = Image.fromarray(img_np)
+
+            # 调整为正方形以便完美拼图
+            size = min(img_pil.size)
+            img_pil = img_pil.crop((0, 0, size, size))
+
+            # 复制4份
+            img1 = img_pil
+            img2 = img_pil
+            img3 = img_pil
+            img4 = img_pil
+
+            # 创建2x2拼图
+            puzzle = Image.new("RGB", (size * 2, size * 2))
+            puzzle.paste(img1, (0, 0))
+            puzzle.paste(img2, (size, 0))
+            puzzle.paste(img3, (0, size))
+            puzzle.paste(img4, (size, size))
+
+            # 调整大小以匹配原始图片尺寸
+            puzzle = puzzle.resize((output_w, output_h), Image.Resampling.LANCZOS)
+
+            # 转换为tensor
+            puzzle_np = np.array(puzzle).astype(np.float32) / 255.0
+            puzzle_tensor = torch.from_numpy(puzzle_np).unsqueeze(0)
+        else:
+            # 如果不需要拼图或没有输入图片，创建空白画布
+            blank = Image.new("RGB", (output_w, output_h), (0, 0, 0))
+            blank_np = np.array(blank).astype(np.float32) / 255.0
+            puzzle_tensor = torch.from_numpy(blank_np).unsqueeze(0)
+
+        # 蒙版转换为tensor
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+
+        return (puzzle_tensor, mask_tensor)
+
+
+class SeamlessPatchMerger:
+    """
+    将传入的图片和蒙版分割成2x2，每一张图使用对应分割的蒙版，合并成一张
+
+    输入：
+        image：需要修复的图片
+        mask：十字蒙版
+
+    输出：
+        image：合并后的图片
+        mask：蒙版拼接到一起，用来确认蒙版合并是否出错
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("merged_image", "composite_mask")
+    FUNCTION = "merge_patches"
+    CATEGORY = "PPP_nodes/Seamless Patch"
+
+    def merge_patches(self, image, mask):
+        # 转换为numpy数组
+        img_np = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        mask_np = (mask.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+        img_pil = Image.fromarray(img_np)
+        mask_pil = Image.fromarray(mask_np)
+
+        h, w = img_pil.size
+        half_h, half_w = h // 2, w // 2
+
+        # 分割成四个象限
+        quadrants = [
+            (0, 0, half_w, half_h),  # 左上
+            (half_w, 0, w, half_h),  # 右上
+            (0, half_h, half_w, h),  # 左下
+            (half_w, half_h, w, h),  # 右下
+        ]
+
+        # 分割图片和蒙版
+        img_patches = []
+        mask_patches = []
+
+        for x1, y1, x2, y2 in quadrants:
+            img_patch = img_pil.crop((x1, y1, x2, y2))
+            mask_patch = mask_pil.crop((x1, y1, x2, y2))
+
+            img_patches.append(img_patch)
+            mask_patches.append(mask_patch)
+
+        # 合并图片 - 使用蒙版进行混合
+        merged = Image.new("RGB", img_pil.size)
+
+        for i, (img_patch, mask_patch, (x1, y1, x2, y2)) in enumerate(
+            zip(img_patches, mask_patches, quadrants)
+        ):
+            # 创建临时画布
+            temp = Image.new("RGB", img_pil.size)
+            temp.paste(img_patch, (x1, y1))
+
+            # 使用对应象限的蒙版进行混合
+            if i == 0:  # 左上
+                # 只保留左上部分的蒙版
+                temp_mask = Image.new("L", img_pil.size, 0)
+                temp_mask.paste(mask_patch, (x1, y1))
+                # 反选蒙版（只保留象限外部）
+                temp_mask = ImageOps.invert(temp_mask)
+            elif i == 1:  # 右上
+                temp_mask = Image.new("L", img_pil.size, 0)
+                temp_mask.paste(mask_patch, (x1, y1))
+                temp_mask = ImageOps.invert(temp_mask)
+            elif i == 2:  # 左下
+                temp_mask = Image.new("L", img_pil.size, 0)
+                temp_mask.paste(mask_patch, (x1, y1))
+                temp_mask = ImageOps.invert(temp_mask)
+            elif i == 3:  # 右下
+                temp_mask = Image.new("L", img_pil.size, 0)
+                temp_mask.paste(mask_patch, (x1, y1))
+                temp_mask = ImageOps.invert(temp_mask)
+
+            # 混合到最终图片
+            merged = Image.composite(merged, temp, temp_mask)
+
+        # 合并蒙版 - 用于验证
+        composite_mask = Image.new("L", img_pil.size, 0)
+
+        for mask_patch, (x1, y1, x2, y2) in zip(mask_patches, quadrants):
+            composite_mask.paste(mask_patch, (x1, y1))
+
+        # 转换回tensor
+        merged_np = np.array(merged).astype(np.float32) / 255.0
+        merged_tensor = torch.from_numpy(merged_np).unsqueeze(0)
+
+        composite_mask_np = np.array(composite_mask).astype(np.float32) / 255.0
+        composite_mask_tensor = torch.from_numpy(composite_mask_np).unsqueeze(0)
+
+        return (merged_tensor, composite_mask_tensor)
+
+
+class SeamlessPuzzlePreview:
+    """
+    创建一个3840x2160像素的无缝拼图预览
+
+    输入接口：
+        image：传入图片，默认缩放到长边1024
+
+    节点菜单：
+        拖动滑块，缩放image大小比例，拖动后会实时预览，默认为50%
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "scale_percent": (
+                    "INT",
+                    {
+                        "default": 50,
+                        "min": 10,
+                        "max": 100,
+                        "step": 5,
+                        "label": "Scale Percentage (%)",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("preview",)
+    FUNCTION = "generate_preview"
+    CATEGORY = "PPP_nodes/Seamless Patch"
+
+    def generate_preview(self, image, scale_percent):
+        # 输出尺寸（3840x2160）
+        OUTPUT_WIDTH = 3840
+        OUTPUT_HEIGHT = 2160
+
+        # 转换为PIL图像
+        img_np = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        img_pil = Image.fromarray(img_np)
+
+        # 首先将图片缩放到长边1024
+        max_side = 1024
+        w, h = img_pil.size
+        if max(w, h) > max_side:
+            ratio = max_side / max(w, h)
+            new_w = int(w * ratio)
+            new_h = int(h * ratio)
+            img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # 再根据缩放比例调整
+        scale_ratio = scale_percent / 100.0
+        final_w = int(img_pil.width * scale_ratio)
+        final_h = int(img_pil.height * scale_ratio)
+        img_scaled = img_pil.resize((final_w, final_h), Image.Resampling.LANCZOS)
+
+        # 创建预览画布（3840x2160，黑色背景）
+        preview = Image.new("RGB", (OUTPUT_WIDTH, OUTPUT_HEIGHT), (0, 0, 0))
+
+        # 计算居中位置
+        x_offset = (OUTPUT_WIDTH - final_w) // 2
+        y_offset = (OUTPUT_HEIGHT - final_h) // 2
+
+        # 复制图片4次，创建2x2拼图
+        # 左上
+        preview.paste(img_scaled, (x_offset, y_offset))
+        # 右上
+        preview.paste(img_scaled, (x_offset + final_w, y_offset))
+        # 左下
+        preview.paste(img_scaled, (x_offset, y_offset + final_h))
+        # 右下
+        preview.paste(img_scaled, (x_offset + final_w, y_offset + final_h))
+
+        # 转换回tensor
+        preview_np = np.array(preview).astype(np.float32) / 255.0
+        preview_tensor = torch.from_numpy(preview_np).unsqueeze(0)
+
+        return (preview_tensor,)
+
+
+# 注册节点
+NODE_CLASS_MAPPINGS = {
+    "SeamlessCrossMaskGenerator": SeamlessCrossMaskGenerator,
+    "SeamlessPatchMerger": SeamlessPatchMerger,
+    "SeamlessPuzzlePreview": SeamlessPuzzlePreview,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SeamlessCrossMaskGenerator": "Cross Mask Generator",
+    "SeamlessPatchMerger": "Patch Merger",
+    "SeamlessPuzzlePreview": "Puzzle Preview",
+}
