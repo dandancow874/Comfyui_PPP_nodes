@@ -23,9 +23,9 @@ class SeamlessCrossMaskGenerator:
                 "mask_size": (
                     "INT",
                     {
-                        "default": 100,
-                        "min": 10,
-                        "max": 500,
+                        "default": 500,
+                        "min": 0,
+                        "max": 1000,
                         "step": 10,
                         "label": "Mask Size (px)",
                     },
@@ -58,12 +58,15 @@ class SeamlessCrossMaskGenerator:
     def generate_cross_mask(self, mask_size, mask_blur, create_2x2_puzzle, image=None):
         # 确定输出尺寸
         if image is not None and create_2x2_puzzle:
-            # 图片尺寸
-            h, w, c = image.shape
-            output_h, output_w = h, w
+            # 图片尺寸（处理批次维度）- 2x2拼图尺寸是原图的2倍
+            if image.shape[0] > 0:
+                h, w, c = image[0].shape
+                output_h, output_w = h * 2, w * 2
+            else:
+                output_h, output_w = 2048, 2048
         else:
             # 默认尺寸
-            output_h, output_w = 1024, 1024
+            output_h, output_w = 2048, 2048
 
         # 生成十字蒙版
         mask = np.zeros((output_h, output_w), dtype=np.float32)
@@ -90,30 +93,20 @@ class SeamlessCrossMaskGenerator:
             mask = np.array(mask_pil).astype(np.float32) / 255.0
 
         # 处理图片输出
-        if image is not None and create_2x2_puzzle:
-            # 创建2x2拼图
-            img_np = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        if image is not None and create_2x2_puzzle and image.shape[0] > 0:
+            # 创建2x2拼图 - 处理批次维度
+            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             img_pil = Image.fromarray(img_np)
 
-            # 调整为正方形以便完美拼图
-            size = min(img_pil.size)
-            img_pil = img_pil.crop((0, 0, size, size))
+            # 创建2x2拼图（尺寸是原图的2倍）
+            w, h = img_pil.size
+            puzzle = Image.new("RGB", (w * 2, h * 2))
 
-            # 复制4份
-            img1 = img_pil
-            img2 = img_pil
-            img3 = img_pil
-            img4 = img_pil
-
-            # 创建2x2拼图
-            puzzle = Image.new("RGB", (size * 2, size * 2))
-            puzzle.paste(img1, (0, 0))
-            puzzle.paste(img2, (size, 0))
-            puzzle.paste(img3, (0, size))
-            puzzle.paste(img4, (size, size))
-
-            # 调整大小以匹配原始图片尺寸
-            puzzle = puzzle.resize((output_w, output_h), Image.Resampling.LANCZOS)
+            # 粘贴四个原图
+            puzzle.paste(img_pil, (0, 0))  # 左上
+            puzzle.paste(img_pil, (w, 0))  # 右上
+            puzzle.paste(img_pil, (0, h))  # 左下
+            puzzle.paste(img_pil, (w, h))  # 右下
 
             # 转换为tensor
             puzzle_np = np.array(puzzle).astype(np.float32) / 255.0
@@ -158,12 +151,18 @@ class SeamlessPatchMerger:
     CATEGORY = "PPP_nodes/Seamless Patch"
 
     def merge_patches(self, image, mask):
-        # 转换为numpy数组
-        img_np = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        mask_np = (mask.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        # 转换为numpy数组 - 处理批次维度
+        if image.shape[0] > 0 and mask.shape[0] > 0:
+            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            mask_np = (mask[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
 
-        img_pil = Image.fromarray(img_np)
-        mask_pil = Image.fromarray(mask_np)
+            img_pil = Image.fromarray(img_np)
+            mask_pil = Image.fromarray(mask_np)
+        else:
+            # 如果没有图像或蒙版，返回默认值
+            h, w = 1024, 1024
+            img_pil = Image.new("RGB", (w, h), (0, 0, 0))
+            mask_pil = Image.new("L", (w, h), 0)
 
         h, w = img_pil.size
         half_h, half_w = h // 2, w // 2
@@ -275,9 +274,16 @@ class SeamlessPuzzlePreview:
         OUTPUT_WIDTH = 3840
         OUTPUT_HEIGHT = 2160
 
-        # 转换为PIL图像
-        img_np = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        img_pil = Image.fromarray(img_np)
+        # 转换为PIL图像 - 处理批次维度
+        if image.shape[0] > 0:
+            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_pil = Image.fromarray(img_np)
+        else:
+            # 如果没有图像，返回空预览
+            preview = Image.new("RGB", (OUTPUT_WIDTH, OUTPUT_HEIGHT), (0, 0, 0))
+            preview_np = np.array(preview).astype(np.float32) / 255.0
+            preview_tensor = torch.from_numpy(preview_np).unsqueeze(0)
+            return (preview_tensor,)
 
         # 首先将图片缩放到长边1024
         max_side = 1024
@@ -288,28 +294,42 @@ class SeamlessPuzzlePreview:
             new_h = int(h * ratio)
             img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-        # 再根据缩放比例调整
+        # 计算缩放后的尺寸
         scale_ratio = scale_percent / 100.0
-        final_w = int(img_pil.width * scale_ratio)
-        final_h = int(img_pil.height * scale_ratio)
+
+        # 计算铺满整个3840x2160的所需尺寸
+        # 首先计算图片的宽高比
+        img_ratio = img_pil.width / img_pil.height
+
+        # 计算铺满预览区域的尺寸
+        preview_ratio = OUTPUT_WIDTH / OUTPUT_HEIGHT
+
+        if img_ratio > preview_ratio:
+            # 图片更宽，以宽度为准
+            final_w = int(OUTPUT_WIDTH * scale_ratio)
+            final_h = int(final_w / img_ratio)
+        else:
+            # 图片更高，以高度为准
+            final_h = int(OUTPUT_HEIGHT * scale_ratio)
+            final_w = int(final_h * img_ratio)
+
+        # 缩放图片
         img_scaled = img_pil.resize((final_w, final_h), Image.Resampling.LANCZOS)
 
         # 创建预览画布（3840x2160，黑色背景）
         preview = Image.new("RGB", (OUTPUT_WIDTH, OUTPUT_HEIGHT), (0, 0, 0))
 
-        # 计算居中位置
-        x_offset = (OUTPUT_WIDTH - final_w) // 2
-        y_offset = (OUTPUT_HEIGHT - final_h) // 2
+        # 计算平铺数量，确保铺满整个预览区域
+        # 计算水平和垂直方向需要平铺的次数
+        tile_w = (OUTPUT_WIDTH + final_w - 1) // final_w  # 向上取整
+        tile_h = (OUTPUT_HEIGHT + final_h - 1) // final_h
 
-        # 复制图片4次，创建2x2拼图
-        # 左上
-        preview.paste(img_scaled, (x_offset, y_offset))
-        # 右上
-        preview.paste(img_scaled, (x_offset + final_w, y_offset))
-        # 左下
-        preview.paste(img_scaled, (x_offset, y_offset + final_h))
-        # 右下
-        preview.paste(img_scaled, (x_offset + final_w, y_offset + final_h))
+        # 平铺图片
+        for i in range(tile_w):
+            for j in range(tile_h):
+                x = i * final_w
+                y = j * final_h
+                preview.paste(img_scaled, (x, y))
 
         # 转换回tensor
         preview_np = np.array(preview).astype(np.float32) / 255.0
