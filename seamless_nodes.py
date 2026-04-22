@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
 
 
 class SeamlessCrossMaskGenerator:
@@ -56,84 +56,73 @@ class SeamlessCrossMaskGenerator:
     CATEGORY = "PPP_nodes/Seamless Patch"
 
     def generate_cross_mask(self, mask_size, mask_blur, create_2x2_puzzle, image=None):
-        # 确定输出尺寸
-        if image is not None and create_2x2_puzzle:
-            # 图片尺寸（处理批次维度）- 2x2拼图尺寸是原图的2倍
-            if image.shape[0] > 0:
-                h, w, c = image[0].shape
-                output_h, output_w = h * 2, w * 2
-            else:
-                output_h, output_w = 2048, 2048
+        # 处理图片
+        has_image = image is not None and image.shape[0] > 0
+        if has_image:
+            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_pil = Image.fromarray(img_np)
+            w, h = img_pil.size
         else:
-            # 默认尺寸
-            output_h, output_w = 2048, 2048
+            h, w = 512, 512
+            img_pil = Image.new("RGB", (w, h), (0, 0, 0))
 
-        # 生成十字蒙版
-        mask = np.zeros((output_h, output_w), dtype=np.float32)
+        if create_2x2_puzzle:
+            # 2x2拼接模式：输出尺寸 = 原图×2
+            output_w, output_h = w * 2, h * 2
 
-        # 计算十字位置
-        center_y, center_x = output_h // 2, output_w // 2
-        half_size = mask_size // 2
+            # 生成2x2拼图
+            puzzle = Image.new("RGB", (output_w, output_h), (0, 0, 0))
+            puzzle.paste(img_pil, (0, 0))
+            puzzle.paste(img_pil, (w, 0))
+            puzzle.paste(img_pil, (0, h))
+            puzzle.paste(img_pil, (w, h))
 
-        # 绘制十字
-        # 水平条
-        y1 = center_y - half_size
-        y2 = center_y + half_size
-        mask[y1:y2, :] = 1.0
+            # 十字蒙版在中心
+            mask = np.zeros((output_h, output_w), dtype=np.float32)
+            half = mask_size // 2
+            cy, cx = output_h // 2, output_w // 2
+            mask[cy - half:cy + half, :] = 1.0
+            mask[:, cx - half:cx + half] = 1.0
+        else:
+            # 不做拼接：输出原图，蒙版十字在中心
+            output_w, output_h = w, h
+            puzzle = img_pil.copy()
 
-        # 垂直条
-        x1 = center_x - half_size
-        x2 = center_x + half_size
-        mask[:, x1:x2] = 1.0
+            # 十字蒙版在中心
+            mask = np.zeros((h, w), dtype=np.float32)
+            half = mask_size // 2
+            cy, cx = h // 2, w // 2
+            mask[cy - half:cy + half, :] = 1.0
+            mask[:, cx - half:cx + half] = 1.0
 
-        # 模糊处理
+        # 蒙版模糊
         if mask_blur > 0:
             mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
             mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(radius=mask_blur))
             mask = np.array(mask_pil).astype(np.float32) / 255.0
 
-        # 处理图片输出
-        if image is not None and create_2x2_puzzle and image.shape[0] > 0:
-            # 创建2x2拼图 - 处理批次维度
-            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np)
-
-            # 创建2x2拼图（尺寸是原图的2倍）
-            w, h = img_pil.size
-            puzzle = Image.new("RGB", (w * 2, h * 2))
-
-            # 粘贴四个原图
-            puzzle.paste(img_pil, (0, 0))  # 左上
-            puzzle.paste(img_pil, (w, 0))  # 右上
-            puzzle.paste(img_pil, (0, h))  # 左下
-            puzzle.paste(img_pil, (w, h))  # 右下
-
-            # 转换为tensor
-            puzzle_np = np.array(puzzle).astype(np.float32) / 255.0
-            puzzle_tensor = torch.from_numpy(puzzle_np).unsqueeze(0)
-        else:
-            # 如果不需要拼图或没有输入图片，创建空白画布
-            blank = Image.new("RGB", (output_w, output_h), (0, 0, 0))
-            blank_np = np.array(blank).astype(np.float32) / 255.0
-            puzzle_tensor = torch.from_numpy(blank_np).unsqueeze(0)
-
-        # 蒙版转换为tensor
+        puzzle_np = np.array(puzzle).astype(np.float32) / 255.0
+        puzzle_tensor = torch.from_numpy(puzzle_np).unsqueeze(0)
         mask_tensor = torch.from_numpy(mask).unsqueeze(0)
 
         return (puzzle_tensor, mask_tensor)
 
 
-class SeamlessPatchMerger:
+class ImageTiler2x2:
     """
-    将传入的图片和蒙版分割成2x2，每一张图使用对应分割的蒙版，合并成一张
+    将图片2x2拼接，中间留出间隔用于生成十字遮罩
 
     输入：
-        image：需要修复的图片
-        mask：十字蒙版
+        image：传入图片
+
+    选项：
+        gap：间隔大小（像素，0-1000）
+        extra_padding：接缝向原图边缘扩展（像素，0-1000），遮住原图边缘用于AI修复
+        bg_color_r/g/b：背景色（默认绿色 0, 255, 0）
 
     输出：
-        image：合并后的图片
-        mask：蒙版拼接到一起，用来确认蒙版合并是否出错
+        image：2x2拼接后的图片（输出尺寸 = 2*原图 + gap）
+        mask：十字接缝蒙版（总宽度 = gap + extra_padding*2）
     """
 
     @classmethod
@@ -141,98 +130,189 @@ class SeamlessPatchMerger:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),
+                "gap": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "label": "Gap (px)",
+                    },
+                ),
+                "extra_padding": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "label": "Extra Padding (px)",
+                    },
+                ),
+                "bg_color_r": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 255,
+                        "step": 1,
+                        "label": "BG Red",
+                    },
+                ),
+                "bg_color_g": (
+                    "INT",
+                    {
+                        "default": 255,
+                        "min": 0,
+                        "max": 255,
+                        "step": 1,
+                        "label": "BG Green",
+                    },
+                ),
+                "bg_color_b": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 255,
+                        "step": 1,
+                        "label": "BG Blue",
+                    },
+                ),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("merged_image", "composite_mask")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "tile_image"
+    CATEGORY = "PPP_nodes/Seamless Patch"
+
+    def tile_image(self, image, gap, extra_padding, bg_color_r, bg_color_g, bg_color_b):
+        # 处理批次维度
+        if image.shape[0] == 0:
+            h, w = 512, 512
+            img_pil = Image.new("RGB", (w, h), (0, 0, 0))
+        else:
+            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_pil = Image.fromarray(img_np)
+
+        w, h = img_pil.size
+        bg_color = (bg_color_r, bg_color_g, bg_color_b)
+
+        # 输出尺寸: 2*原图 + gap
+        out_w = w * 2 + gap
+        out_h = h * 2 + gap
+
+        # 创建画布，用背景色填充
+        tiled = Image.new("RGB", (out_w, out_h), bg_color)
+
+        # 粘贴四个原图
+        tiled.paste(img_pil, (0, 0))  # 左上
+        tiled.paste(img_pil, (w + gap, 0))  # 右上
+        tiled.paste(img_pil, (0, h + gap))  # 左下
+        tiled.paste(img_pil, (w + gap, h + gap))  # 右下
+
+        # 如果有 extra_padding，用背景色覆盖原图边缘（扩大接缝区域）
+        if extra_padding > 0:
+            pad = extra_padding
+            # 水平条带（覆盖原图上下边缘 + 中间间隔）
+            ImageDraw.Draw(tiled).rectangle(
+                [0, h - pad, out_w, h + gap + pad], fill=bg_color
+            )
+            # 垂直条带（覆盖原图左右边缘 + 中间间隔）
+            ImageDraw.Draw(tiled).rectangle(
+                [w - pad, 0, w + gap + pad, out_h], fill=bg_color
+            )
+
+        # 生成十字蒙版
+        mask = np.zeros((out_h, out_w), dtype=np.float32)
+        # 水平条带: y 从 h-extra_padding 到 h+gap+extra_padding
+        mask[max(0, h - extra_padding) : min(out_h, h + gap + extra_padding), :] = 1.0
+        # 垂直条带: x 从 w-extra_padding 到 w+gap+extra_padding
+        mask[:, max(0, w - extra_padding) : min(out_w, w + gap + extra_padding)] = 1.0
+
+        # 转换为tensor
+        tiled_np = np.array(tiled).astype(np.float32) / 255.0
+        tiled_tensor = torch.from_numpy(tiled_np).unsqueeze(0)
+
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+
+        return (tiled_tensor, mask_tensor)
+
+
+class SeamlessPatchMerger:
+    """
+    修正无缝拼贴图案：从修好的2x2图中提取边缘，贴回单个tile
+
+    输入：
+        fixed_image：2x2拼接后修复好接缝的图片
+        mask：十字接缝蒙版
+
+    处理逻辑：
+        输出单个tile（原图尺寸），从四个象限各取一条边缘贴回：
+        - BL上边缘 → tile上边缘（覆盖水平接缝）
+        - TL下边缘 → tile下边缘（覆盖水平接缝）
+        - TR左边缘 → tile左边缘（覆盖垂直接缝）
+        - BR右边缘 → tile右边缘（覆盖垂直接缝）
+
+    输出：
+        image：无缝拼贴的单个tile
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "fixed_image": ("IMAGE",),
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
     FUNCTION = "merge_patches"
     CATEGORY = "PPP_nodes/Seamless Patch"
 
-    def merge_patches(self, image, mask):
-        # 转换为numpy数组 - 处理批次维度
-        if image.shape[0] > 0 and mask.shape[0] > 0:
-            img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            mask_np = (mask[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    def merge_patches(self, fixed_image, mask):
+        if fixed_image.shape[0] == 0 or mask.shape[0] == 0:
+            blank = Image.new("RGB", (512, 512), (0, 0, 0))
+            blank_np = np.array(blank).astype(np.float32) / 255.0
+            return (torch.from_numpy(blank_np).unsqueeze(0),)
 
-            img_pil = Image.fromarray(img_np)
-            mask_pil = Image.fromarray(mask_np)
-        else:
-            # 如果没有图像或蒙版，返回默认值
-            h, w = 1024, 1024
-            img_pil = Image.new("RGB", (w, h), (0, 0, 0))
-            mask_pil = Image.new("L", (w, h), 0)
+        fixed_np = (fixed_image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        fixed_pil = Image.fromarray(fixed_np)
+        mask_np = mask[0].cpu().numpy()
 
-        h, w = img_pil.size
-        half_h, half_w = h // 2, w // 2
+        Fx, Fy = fixed_pil.size
 
-        # 分割成四个象限
-        quadrants = [
-            (0, 0, half_w, half_h),  # 左上
-            (half_w, 0, w, half_h),  # 右上
-            (0, half_h, half_w, h),  # 左下
-            (half_w, half_h, w, h),  # 右下
-        ]
+        # tile尺寸（象限尺寸）
+        W = Fx // 2
+        H = Fy // 2
 
-        # 分割图片和蒙版
-        img_patches = []
-        mask_patches = []
+        # 从修好图裁剪四个象限
+        tl = fixed_pil.crop((0, 0, W, H))
+        tr = fixed_pil.crop((W, 0, Fx, H))
+        bl = fixed_pil.crop((0, H, W, Fy))
+        br = fixed_pil.crop((W, H, Fx, Fy))
 
-        for x1, y1, x2, y2 in quadrants:
-            img_patch = img_pil.crop((x1, y1, x2, y2))
-            mask_patch = mask_pil.crop((x1, y1, x2, y2))
+        # 从mask裁剪四个象限的蒙版
+        mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8))
+        mask_tl = mask_pil.crop((0, 0, W, H))
+        mask_tr = mask_pil.crop((W, 0, Fx, H))
+        mask_bl = mask_pil.crop((0, H, W, Fy))
+        mask_br = mask_pil.crop((W, H, Fx, Fy))
 
-            img_patches.append(img_patch)
-            mask_patches.append(mask_patch)
+        # TL作为基础，用蒙版把相邻象限的接缝内容混合进来
+        result = tl.copy()
+        result = Image.composite(result, bl, mask_bl)  # BL的上边缘
+        result = Image.composite(result, tr, mask_tr)  # TR的左边缘
+        result = Image.composite(result, br, mask_br)  # BR的右边缘
 
-        # 合并图片 - 使用蒙版进行混合
-        merged = Image.new("RGB", img_pil.size)
+        result_np = np.array(result).astype(np.float32) / 255.0
+        result_tensor = torch.from_numpy(result_np).unsqueeze(0)
 
-        for i, (img_patch, mask_patch, (x1, y1, x2, y2)) in enumerate(
-            zip(img_patches, mask_patches, quadrants)
-        ):
-            # 创建临时画布
-            temp = Image.new("RGB", img_pil.size)
-            temp.paste(img_patch, (x1, y1))
-
-            # 使用对应象限的蒙版进行混合
-            if i == 0:  # 左上
-                # 只保留左上部分的蒙版
-                temp_mask = Image.new("L", img_pil.size, 0)
-                temp_mask.paste(mask_patch, (x1, y1))
-                # 反选蒙版（只保留象限外部）
-                temp_mask = ImageOps.invert(temp_mask)
-            elif i == 1:  # 右上
-                temp_mask = Image.new("L", img_pil.size, 0)
-                temp_mask.paste(mask_patch, (x1, y1))
-                temp_mask = ImageOps.invert(temp_mask)
-            elif i == 2:  # 左下
-                temp_mask = Image.new("L", img_pil.size, 0)
-                temp_mask.paste(mask_patch, (x1, y1))
-                temp_mask = ImageOps.invert(temp_mask)
-            elif i == 3:  # 右下
-                temp_mask = Image.new("L", img_pil.size, 0)
-                temp_mask.paste(mask_patch, (x1, y1))
-                temp_mask = ImageOps.invert(temp_mask)
-
-            # 混合到最终图片
-            merged = Image.composite(merged, temp, temp_mask)
-
-        # 合并蒙版 - 用于验证
-        composite_mask = Image.new("L", img_pil.size, 0)
-
-        for mask_patch, (x1, y1, x2, y2) in zip(mask_patches, quadrants):
-            composite_mask.paste(mask_patch, (x1, y1))
-
-        # 转换回tensor
-        merged_np = np.array(merged).astype(np.float32) / 255.0
-        merged_tensor = torch.from_numpy(merged_np).unsqueeze(0)
-
-        composite_mask_np = np.array(composite_mask).astype(np.float32) / 255.0
-        composite_mask_tensor = torch.from_numpy(composite_mask_np).unsqueeze(0)
-
-        return (merged_tensor, composite_mask_tensor)
+        return (result_tensor,)
 
 
 class SeamlessPuzzlePreview:
@@ -338,15 +418,154 @@ class SeamlessPuzzlePreview:
         return (preview_tensor,)
 
 
+class SeamlessTileCropper:
+    """
+    从2x2大图中心精确裁剪出无缝tile
+
+    原理：从十字接缝交叉点裁剪 W×H 的区域，
+    四条边都穿过修复过的接缝区域，自然无缝。
+
+    输入：
+        image：修复好接缝的2x2图片 (2W × 2H)
+
+    输出：
+        image：无缝tile (W × H)
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "crop_tile"
+    CATEGORY = "PPP_nodes/Seamless Patch"
+
+    def crop_tile(self, image):
+        if image.shape[0] == 0:
+            blank = Image.new("RGB", (512, 512), (0, 0, 0))
+            blank_np = np.array(blank).astype(np.float32) / 255.0
+            return (torch.from_numpy(blank_np).unsqueeze(0),)
+
+        img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        img_pil = Image.fromarray(img_np)
+
+        Fx, Fy = img_pil.size
+        W = Fx // 2
+        H = Fy // 2
+
+        # 从中心裁剪：十字路口的四个角就是每个象限修复好的接缝部分
+        # ┌───┬───┐
+        # │   │   │
+        # ├───┼───┤  ← 裁剪区域在正中心
+        # │   │   │
+        # └───┴───┘
+        x1 = W // 2
+        y1 = H // 2
+        tile = img_pil.crop((x1, y1, x1 + W, y1 + H))
+
+        result_np = np.array(tile).astype(np.float32) / 255.0
+        result_tensor = torch.from_numpy(result_np).unsqueeze(0)
+
+        return (result_tensor,)
+
+
+class SeamlessOffsetFilter:
+    """
+    模仿Photoshop位移滤镜：将图像边缘移动到中心，暴露接缝供修复
+
+    原理：用np.roll将像素滚动，原图的四条边缘移到画面中心形成十字。
+    修复中心的接缝后，再反向位移回来就得到无缝tile。
+
+    输入：
+        image：图片
+        offset_x：水平位移（像素），默认为图片宽度的一半
+        offset_y：垂直位移（像素），默认为图片高度的一半
+
+    输出：
+        image：位移后的图片
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "offset_x": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": -8192,
+                        "max": 8192,
+                        "step": 1,
+                        "label": "Horizontal Offset (px)",
+                    },
+                ),
+                "offset_y": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": -8192,
+                        "max": 8192,
+                        "step": 1,
+                        "label": "Vertical Offset (px)",
+                    },
+                ),
+                "use_half": (
+                    "BOOLEAN",
+                    {"default": True, "label": "Auto Half (offset_x/y ignored)"},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "apply_offset"
+    CATEGORY = "PPP_nodes/Seamless Patch"
+
+    def apply_offset(self, image, offset_x, offset_y, use_half):
+        if image.shape[0] == 0:
+            blank = Image.new("RGB", (512, 512), (0, 0, 0))
+            blank_np = np.array(blank).astype(np.float32) / 255.0
+            return (torch.from_numpy(blank_np).unsqueeze(0),)
+
+        img_np = image[0].cpu().numpy()
+        h, w, c = img_np.shape
+
+        if use_half:
+            offset_x = w // 2
+            offset_y = h // 2
+
+        # np.roll: 沿轴滚动像素
+        # axis=1 (水平): 正值→像素右移，左边缘移到中心
+        # axis=0 (垂直): 正值→像素下移，上边缘移到中心
+        result = np.roll(img_np, shift=offset_x, axis=1)
+        result = np.roll(result, shift=offset_y, axis=0)
+
+        result_tensor = torch.from_numpy(result).unsqueeze(0)
+
+        return (result_tensor,)
+
+
 # 注册节点
 NODE_CLASS_MAPPINGS = {
     "SeamlessCrossMaskGenerator": SeamlessCrossMaskGenerator,
+    "ImageTiler2x2": ImageTiler2x2,
     "SeamlessPatchMerger": SeamlessPatchMerger,
+    "SeamlessTileCropper": SeamlessTileCropper,
+    "SeamlessOffsetFilter": SeamlessOffsetFilter,
     "SeamlessPuzzlePreview": SeamlessPuzzlePreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeamlessCrossMaskGenerator": "Cross Mask Generator",
+    "ImageTiler2x2": "Image Tiler 2x2",
     "SeamlessPatchMerger": "Patch Merger",
+    "SeamlessTileCropper": "Tile Cropper",
+    "SeamlessOffsetFilter": "Offset Filter",
     "SeamlessPuzzlePreview": "Puzzle Preview",
 }
