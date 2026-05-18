@@ -1,12 +1,91 @@
 import os
+import hashlib
 import torch
 import numpy as np
 import json5  # 需要 pip install json5
 from PIL import Image, ImageOps
 
+try:
+    import folder_paths
+except Exception:
+    folder_paths = None
+
 
 # 默认支持的图片扩展名
 DEFAULT_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff')
+SOURCE_INFO_TYPE = "PPP_SOURCE_INFO"
+BATCH_CATEGORY = "🧩 PPP_nodes/Batch Walker"
+
+
+def make_source_info(path, root):
+    abs_path = os.path.abspath(path)
+    abs_root = os.path.abspath(root) if root else os.path.dirname(abs_path)
+    parent = os.path.dirname(abs_path)
+
+    try:
+        rel_parent = os.path.relpath(parent, abs_root)
+        if rel_parent == ".":
+            rel_parent = ""
+    except ValueError:
+        rel_parent = ""
+
+    return {
+        "path": abs_path,
+        "parent": parent,
+        "filename": os.path.basename(abs_path),
+        "root": abs_root,
+        "relative_parent": rel_parent,
+    }
+
+
+def normalize_source_info(source_info, index=0):
+    if isinstance(source_info, (list, tuple)):
+        if not source_info:
+            raise ValueError("source_info is empty.")
+        source_info = source_info[min(index, len(source_info) - 1)]
+
+    if isinstance(source_info, str):
+        try:
+            source_info = json5.loads(source_info)
+        except Exception as exc:
+            raise ValueError("source_info string is not valid JSON/JSON5.") from exc
+
+    if not isinstance(source_info, dict):
+        raise TypeError(f"source_info must be a dict, got {type(source_info).__name__}.")
+
+    parent = source_info.get("parent") or os.path.dirname(source_info.get("path", ""))
+    filename = source_info.get("filename") or os.path.basename(source_info.get("path", ""))
+    root = source_info.get("root") or parent
+
+    if not filename:
+        raise ValueError("source_info must contain filename or path.")
+
+    return parent, filename, root
+
+
+def default_output_folder():
+    if folder_paths is not None:
+        return folder_paths.get_output_directory()
+    return os.getcwd()
+
+
+def load_image_file(path):
+    img = Image.open(path)
+    icc = img.info.get('icc_profile')
+    img = ImageOps.exif_transpose(img)
+
+    if img.mode == 'RGBA':
+        r, g, b, a = img.split()
+        img_rgb = Image.merge('RGB', (r, g, b))
+        mask = np.array(a).astype(np.float32) / 255.0
+        mask = torch.from_numpy(mask)
+    else:
+        img_rgb = img.convert('RGB')
+        mask = torch.ones((img_rgb.height, img_rgb.width), dtype=torch.float32, device="cpu")
+
+    img_np = np.array(img_rgb).astype(np.float32) / 255.0
+    img_tensor = torch.from_numpy(img_np)
+    return img_tensor, mask, icc
 
 class BatchImageLoaderRecursive:
     @classmethod
@@ -21,14 +100,14 @@ class BatchImageLoaderRecursive:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING", "ICC_PROFILE")
-    RETURN_NAMES = ("images", "masks", "file_parent_folders", "filenames", "original_root_ref", "icc_profiles")
+    RETURN_TYPES = ("IMAGE", "MASK", SOURCE_INFO_TYPE, "ICC_PROFILE")
+    RETURN_NAMES = ("images", "masks", "source_infos", "icc_profiles")
     
     # 输出列表，允许不同尺寸图片混合
-    OUTPUT_IS_LIST = (True, True, True, True, True, True)
+    OUTPUT_IS_LIST = (True, True, True, True)
     
     FUNCTION = "load_images"
-    CATEGORY = "PPP_nodes/Batch Walker"
+    CATEGORY = BATCH_CATEGORY
 
     # 强制每次运行都检查文件夹变化
     @classmethod
@@ -56,7 +135,7 @@ class BatchImageLoaderRecursive:
 
         if not image_paths:
             print(f"BatchLoader: No images found in {folder_path}")
-            return ([], [], [], [], [], [])
+            return ([], [], [], [])
 
         image_paths.sort()
         total_found = len(image_paths)
@@ -70,36 +149,17 @@ class BatchImageLoaderRecursive:
 
         images = []
         masks = []
-        parent_paths = []
-        filenames = []
-        root_paths = [] 
+        source_infos = []
         icc_profiles = []
 
         for path in image_paths:
             try:
-                img = Image.open(path)
-                icc = img.info.get('icc_profile')
-                img = ImageOps.exif_transpose(img)
-
-                if img.mode == 'RGBA':
-                    r, g, b, a = img.split()
-                    img_rgb = Image.merge('RGB', (r, g, b))
-                    mask = np.array(a).astype(np.float32) / 255.0
-                    mask = torch.from_numpy(mask)
-                else:
-                    img_rgb = img.convert('RGB')
-                    mask = torch.ones((img_rgb.height, img_rgb.width), dtype=torch.float32, device="cpu")
-
-                img_np = np.array(img_rgb).astype(np.float32) / 255.0
-                img_tensor = torch.from_numpy(img_np)
+                img_tensor, mask, icc = load_image_file(path)
                 
                 # 封装进 List
                 images.append(img_tensor.unsqueeze(0)) 
                 masks.append(mask.unsqueeze(0))
-                
-                parent_paths.append(os.path.dirname(path))
-                filenames.append(os.path.basename(path))
-                root_paths.append(folder_path)
+                source_infos.append(make_source_info(path, folder_path))
                 icc_profiles.append(icc)
 
             except Exception as e:
@@ -108,10 +168,10 @@ class BatchImageLoaderRecursive:
 
         if not images:
             print("BatchLoader: All found images failed to load.")
-            return ([], [], [], [], [], [])
+            return ([], [], [], [])
 
         print(f"BatchLoader: Successfully loaded {len(images)} images.")
-        return (images, masks, parent_paths, filenames, root_paths, icc_profiles)
+        return (images, masks, source_infos, icc_profiles)
 
 
 class BatchImageSaverRecursive:
@@ -120,9 +180,7 @@ class BatchImageSaverRecursive:
         return {
             "required": {
                 "images": ("IMAGE", ),
-                "file_parent_folders": ("STRING", {"forceInput": True}),
-                "filenames": ("STRING", {"forceInput": True}),
-                "original_root_ref": ("STRING", {"forceInput": True}),
+                "source_info": (SOURCE_INFO_TYPE, {"forceInput": True}),
                 "output_root": ("STRING", {"default": ""}),
                 "format": (["auto", "png", "jpg", "webp"],),
                 "compression_mode": (["lossless (无损)", "lossy (压缩)"], {"default": "lossless (无损)"}),
@@ -138,12 +196,12 @@ class BatchImageSaverRecursive:
     RETURN_TYPES = ()
     FUNCTION = "save_images"
     OUTPUT_NODE = True
-    CATEGORY = "PPP_nodes/Batch Walker"
+    CATEGORY = BATCH_CATEGORY
     
     # 设为 False 以流式处理（每处理完一张保存一张）
     INPUT_IS_LIST = False 
 
-    def save_images(self, images, file_parent_folders, filenames, original_root_ref, output_root, format, compression_mode, quality, filename_suffix, collision_mode, icc_profile=None):
+    def save_images(self, images, source_info, output_root, format, compression_mode, quality, filename_suffix, collision_mode, icc_profile=None):
         
         out_dir_base = output_root.strip()
         
@@ -155,22 +213,20 @@ class BatchImageSaverRecursive:
         for i in range(images.shape[0]):
             img_tensor = images[i]
             
-            src_parent = file_parent_folders
-            src_filename = filenames
-            src_root = original_root_ref
+            src_parent, src_filename, src_root = normalize_source_info(source_info, i)
 
             img_array = 255. * img_tensor.cpu().numpy()
             img_pil = Image.fromarray(np.clip(img_array, 0, 255).astype(np.uint8))
 
             # 1. 计算相对路径
             try:
-                rel_path = os.path.relpath(src_parent, src_root)
+                rel_path = os.path.relpath(src_parent, src_root) if src_parent and src_root else ""
             except ValueError:
                 rel_path = ""
 
             # 2. 确定保存目录
             if not out_dir_base or out_dir_base == "":
-                target_folder = src_parent
+                target_folder = src_parent or default_output_folder()
             else:
                 target_folder = os.path.join(out_dir_base, rel_path)
 
@@ -245,11 +301,9 @@ class BatchTextSaverRecursive:
         return {
             "required": {
                 "text_data": ("STRING", {"forceInput": True}),
-                "file_parent_folders": ("STRING", {"forceInput": True}),
-                "filenames": ("STRING", {"forceInput": True}),
-                "original_root_ref": ("STRING", {"forceInput": True}),
+                "source_info": (SOURCE_INFO_TYPE, {"forceInput": True}),
                 "output_root": ("STRING", {"default": ""}),
-                "extension": (["auto", "txt", "json", "md"], {"default": "txt"}),
+                "extension": (["txt", "json", "md"], {"default": "txt"}),
                 "filename_suffix": ("STRING", {"default": ""}),
                 "collision_mode": (["overwrite", "skip", "rename"], {"default": "overwrite"}),
             },
@@ -258,40 +312,31 @@ class BatchTextSaverRecursive:
     RETURN_TYPES = ()
     FUNCTION = "save_text"
     OUTPUT_NODE = True
-    CATEGORY = "PPP_nodes/Batch Walker"
+    CATEGORY = BATCH_CATEGORY
     INPUT_IS_LIST = False 
 
-    def save_text(self, text_data, file_parent_folders, filenames, original_root_ref, output_root, extension, filename_suffix, collision_mode):
+    def save_text(self, text_data, source_info, output_root, extension, filename_suffix, collision_mode):
         
-        src_parent = file_parent_folders
-        src_filename = filenames
-        src_root = original_root_ref
+        src_parent, src_filename, src_root = normalize_source_info(source_info)
         mode = collision_mode
         suffix = filename_suffix
 
         try:
-            rel_path = os.path.relpath(src_parent, src_root)
+            rel_path = os.path.relpath(src_parent, src_root) if src_parent and src_root else ""
         except ValueError:
             rel_path = ""
 
         # 使用兼容性更好的写法判断路径
         out_dir_base = output_root.strip()
         if not out_dir_base or out_dir_base == "":
-            target_folder = src_parent
+            target_folder = src_parent or default_output_folder()
         else:
             target_folder = os.path.join(out_dir_base, rel_path)
 
         if not os.path.exists(target_folder):
             os.makedirs(target_folder, exist_ok=True)
 
-        # Determine extension
-        if extension == "auto":
-             _, ext = os.path.splitext(src_filename)
-             save_extension = ext.lower().lstrip('.')
-             if not save_extension:
-                 save_extension = 'txt'
-        else:
-            save_extension = extension
+        save_extension = extension
 
         file_name_no_ext, _ = os.path.splitext(src_filename)
         base_new_filename = f"{file_name_no_ext}{suffix}.{save_extension}"
@@ -336,6 +381,83 @@ class BatchTextSaverRecursive:
             print(f"Error saving text {save_path}: {e}")
 
         return {}
+
+
+class SourceInfoImageLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        files = []
+        input_dir = folder_paths.get_input_directory() if folder_paths is not None else os.getcwd()
+        if os.path.isdir(input_dir):
+            for root, dirs, filenames in os.walk(input_dir):
+                for filename in filenames:
+                    if filename.lower().endswith(DEFAULT_IMAGE_EXTENSIONS):
+                        full_path = os.path.join(root, filename)
+                        files.append(os.path.relpath(full_path, input_dir))
+
+        files = sorted(files)
+        if not files:
+            files = ["None"]
+
+        return {
+            "required": {
+                "image": (files, {"image_upload": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", SOURCE_INFO_TYPE, "ICC_PROFILE")
+    RETURN_NAMES = ("image", "mask", "source_info", "icc_profile")
+    FUNCTION = "load_image"
+    CATEGORY = BATCH_CATEGORY
+
+    @classmethod
+    def IS_CHANGED(s, image):
+        path = s.resolve_image_path(image)
+        if not path or not os.path.exists(path):
+            return float("NaN")
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def resolve_image_path(image):
+        if image == "None":
+            return None
+
+        if folder_paths is not None:
+            return folder_paths.get_annotated_filepath(image)
+
+        return os.path.abspath(image)
+
+    @staticmethod
+    def resolve_root_path(image, path):
+        if folder_paths is None:
+            return os.path.dirname(path)
+
+        input_dir = folder_paths.get_input_directory()
+        output_dir = folder_paths.get_output_directory()
+        temp_dir = folder_paths.get_temp_directory()
+
+        annotated = str(image)
+        if annotated.endswith("[output]"):
+            return output_dir
+        if annotated.endswith("[temp]"):
+            return temp_dir
+        return input_dir
+
+    def load_image(self, image):
+        path = self.resolve_image_path(image)
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(f"Image not found: {image}")
+
+        img_tensor, mask, icc = load_image_file(path)
+        source_info = {"filename": os.path.basename(path)}
+        return (img_tensor.unsqueeze(0), mask.unsqueeze(0), source_info, icc)
+
+
 class BatchImageLoaderByIndex:
     @classmethod
     def INPUT_TYPES(s):
@@ -353,11 +475,11 @@ class BatchImageLoaderByIndex:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING", "INT", "ICC_PROFILE")
-    RETURN_NAMES = ("image", "mask", "file_parent_folder", "filename", "original_root_ref", "file_count", "icc_profile")
-    OUTPUT_IS_LIST = (False, False, False, False, False, False, False)
+    RETURN_TYPES = ("IMAGE", "MASK", SOURCE_INFO_TYPE, "INT", "ICC_PROFILE")
+    RETURN_NAMES = ("image", "mask", "source_info", "file_count", "icc_profile")
+    OUTPUT_IS_LIST = (False, False, False, False, False)
     FUNCTION = "load_image_by_index"
-    CATEGORY = "Batch Walker"
+    CATEGORY = BATCH_CATEGORY
 
     @classmethod
     def IS_CHANGED(s, folder_path, extensions, index, seed, batch_limit):
@@ -402,7 +524,7 @@ class BatchImageLoaderByIndex:
             print(f"BatchLoader: No images found.")
             empty_img = torch.zeros((1, 64, 64, 3), dtype=torch.float32, device="cpu")
             empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32, device="cpu")
-            return (empty_img, empty_mask, "", "", "", 0, None)
+            return (empty_img, empty_mask, {}, 0, None)
 
         # 取模循环
         safe_index = real_index % total_count
@@ -411,27 +533,12 @@ class BatchImageLoaderByIndex:
         print(f"BatchLoader (Pos {real_index}): Loading {safe_index + 1}/{total_count} -> {os.path.basename(target_path)}")
 
         try:
-            img = Image.open(target_path)
-            icc = img.info.get('icc_profile')
-            img = ImageOps.exif_transpose(img)
-
-            if img.mode == 'RGBA':
-                r, g, b, a = img.split()
-                img_rgb = Image.merge('RGB', (r, g, b))
-                mask = np.array(a).astype(np.float32) / 255.0
-                mask = torch.from_numpy(mask)
-            else:
-                img_rgb = img.convert('RGB')
-                mask = torch.ones((img_rgb.height, img_rgb.width), dtype=torch.float32, device="cpu")
-
-            img_np = np.array(img_rgb).astype(np.float32) / 255.0
-            img_tensor = torch.from_numpy(img_np).unsqueeze(0)
+            img_tensor, mask, icc = load_image_file(target_path)
+            img_tensor = img_tensor.unsqueeze(0)
             mask = mask.unsqueeze(0)
+            source_info = make_source_info(target_path, folder_path)
 
-            parent_dir = os.path.dirname(target_path)
-            filename = os.path.basename(target_path)
-
-            return (img_tensor, mask, parent_dir, filename, folder_path, total_count, icc)
+            return (img_tensor, mask, source_info, total_count, icc)
 
         except Exception as e:
             print(f"Error loading {target_path}: {e}")
@@ -441,9 +548,10 @@ class BatchImageLoaderByIndex:
             empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32, device="cpu")
             
             # 返回 empty_mask 而不是未定义的 mask
-            return (empty_img, empty_mask, "", "", "", total_count, None)
+            return (empty_img, empty_mask, {}, total_count, None)
 
 NODE_CLASS_MAPPINGS = {
+    "SourceInfoImageLoader": SourceInfoImageLoader,
     "BatchImageLoaderRecursive": BatchImageLoaderRecursive,
     "BatchImageLoaderByIndex": BatchImageLoaderByIndex,
     "BatchImageSaverRecursive": BatchImageSaverRecursive,
@@ -452,9 +560,10 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BatchImageLoaderRecursive": "Batch Loader (Recursive/List)",
-    "BatchImageLoaderByIndex": "Batch Loader (Index/Single)",
-    "BatchImageSaverRecursive": "Batch Saver (Image)",
-    "BatchTextSaverRecursive": "Batch Saver (Text)",
+    "SourceInfoImageLoader": "📥 PPP Load Image",
+    "BatchImageLoaderRecursive": "📂 Batch Loader (Recursive/List)",
+    "BatchImageLoaderByIndex": "🔢 Batch Loader (Index/Single)",
+    "BatchImageSaverRecursive": "💾 Batch Saver (Image)",
+    "BatchTextSaverRecursive": "📝 Batch Saver (Text)",
 
 }
