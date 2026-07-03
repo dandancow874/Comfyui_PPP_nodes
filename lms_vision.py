@@ -83,16 +83,10 @@ class LMS_CLI_Handler:
                 # 尝试解析 JSON
                 data = json.loads(stdout)
                 for item in data:
-                    # 优先使用 path，其次是 modelKey
-                    # 注意：lms load 命令通常接受 path 或 modelKey
-                    model_path = item.get("path") or item.get("modelKey")
+                    # 优先使用 modelKey。新版 lms load 对部分 GGUF 模型不接受 path，
+                    # 例如 tencent/Hy-MT2... 必须用 hy-mt2-1.8b 才能加载。
+                    model_path = item.get("modelKey") or item.get("path")
                     if model_path:
-                        # 如果 path 是 "qwen/qwen3-vl-4b"，我们保留它
-                        # 如果 path 是 "publisher/repo/file.gguf"，我们也保留它
-                        # 只有当它是 .gguf 结尾时，我们才去掉后缀，为了显示美观
-                        if model_path.lower().endswith(".gguf"):
-                             model_path = model_path[:-5]
-                        
                         models.append(model_path)
             except json.JSONDecodeError:
                 logger.warning("LMS: Failed to parse 'lms ls --json', falling back to text parsing.")
@@ -146,8 +140,78 @@ class LMS_CLI_Handler:
         args = ["load", model_name, "--identifier", identifier, "--gpu", gpu_arg, "--context-length", str(context_length), "-y"]
         
         success, stdout, stderr = cls.run_cmd(args, timeout=180)
+        if not success:
+            fallback_name = cls.resolve_model_key(model_name)
+            if fallback_name and fallback_name != model_name:
+                logger.warning(f"LMS: Retrying load with modelKey '{fallback_name}'...")
+                args[1] = fallback_name
+                success, stdout, stderr = cls.run_cmd(args, timeout=180)
+
         if not success: logger.error(f"LMS Load Error: {stderr}")
         return success
+
+    @classmethod
+    def resolve_model_key(cls, model_name):
+        success, stdout, stderr = cls.run_cmd(["ls", "--json"], timeout=10)
+        if not success:
+            return None
+
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+
+        requested = model_name.lower()
+        requested_no_ext = requested[:-5] if requested.endswith(".gguf") else requested
+        for item in data:
+            model_key = item.get("modelKey")
+            if not model_key:
+                continue
+
+            candidates = [
+                item.get("path"),
+                item.get("indexedModelIdentifier"),
+                item.get("displayName"),
+            ]
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                candidate_lower = candidate.lower()
+                candidate_no_ext = candidate_lower[:-5] if candidate_lower.endswith(".gguf") else candidate_lower
+                if requested in (candidate_lower, candidate_no_ext) or requested_no_ext in (candidate_lower, candidate_no_ext):
+                    return model_key
+
+        return None
+
+    @classmethod
+    def get_model_metadata(cls, model_name):
+        success, stdout, stderr = cls.run_cmd(["ls", "--json"], timeout=10)
+        if not success:
+            return None
+
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+
+        requested = model_name.lower()
+        requested_no_ext = requested[:-5] if requested.endswith(".gguf") else requested
+        for item in data:
+            candidates = [
+                item.get("modelKey"),
+                item.get("path"),
+                item.get("indexedModelIdentifier"),
+                item.get("displayName"),
+            ]
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                candidate_lower = candidate.lower()
+                candidate_no_ext = candidate_lower[:-5] if candidate_lower.endswith(".gguf") else candidate_lower
+                if requested in (candidate_lower, candidate_no_ext) or requested_no_ext in (candidate_lower, candidate_no_ext):
+                    return item
+
+        return None
 
     @classmethod
     def unload_all(cls):
@@ -259,6 +323,11 @@ class LMS_VisionController:
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
                     })
+
+        if image_content_list:
+            model_metadata = self.cli.get_model_metadata(model_name)
+            if model_metadata and model_metadata.get("vision") is False:
+                return (f"Error: Model '{model_name}' is text-only. Remove image inputs or choose a vision-capable model.",)
 
         # 4. 加载模型 (保持不变)
         needs_reload = (
@@ -475,7 +544,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LMS_VisionController": "LM Studio VLM",
+    "LMS_VisionController": "LM Studio Chat / Vision",
     "LMS_LoadPrompt": "📂 Load Prompt",
     "LMS_SavePrompt": "💾 Save Prompt"
 }
