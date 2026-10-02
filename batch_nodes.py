@@ -63,10 +63,18 @@ def normalize_source_info(source_info, index=0):
     return parent, filename, root
 
 
-def default_output_folder():
-    if folder_paths is not None:
-        return folder_paths.get_output_directory()
-    return os.getcwd()
+def resolve_save_folder(src_parent, src_root, output_root):
+    out_dir_base = output_root.strip()
+    if not out_dir_base:
+        if not src_parent:
+            raise ValueError("output_root is empty and source_info has no source directory.")
+        return src_parent
+
+    try:
+        rel_path = os.path.relpath(src_parent, src_root) if src_parent and src_root else ""
+    except ValueError:
+        rel_path = ""
+    return os.path.join(out_dir_base, rel_path)
 
 
 def load_image_file(path):
@@ -203,8 +211,6 @@ class BatchImageSaverRecursive:
 
     def save_images(self, images, source_info, output_root, format, compression_mode, quality, filename_suffix, collision_mode, icc_profile=None):
         
-        out_dir_base = output_root.strip()
-        
         suffix = filename_suffix
         mode = collision_mode
         is_lossless = "lossless" in compression_mode
@@ -218,17 +224,7 @@ class BatchImageSaverRecursive:
             img_array = 255. * img_tensor.cpu().numpy()
             img_pil = Image.fromarray(np.clip(img_array, 0, 255).astype(np.uint8))
 
-            # 1. 计算相对路径
-            try:
-                rel_path = os.path.relpath(src_parent, src_root) if src_parent and src_root else ""
-            except ValueError:
-                rel_path = ""
-
-            # 2. 确定保存目录
-            if not out_dir_base or out_dir_base == "":
-                target_folder = src_parent or default_output_folder()
-            else:
-                target_folder = os.path.join(out_dir_base, rel_path)
+            target_folder = resolve_save_folder(src_parent, src_root, output_root)
 
             if not os.path.exists(target_folder):
                 os.makedirs(target_folder, exist_ok=True)
@@ -321,17 +317,7 @@ class BatchTextSaverRecursive:
         mode = collision_mode
         suffix = filename_suffix
 
-        try:
-            rel_path = os.path.relpath(src_parent, src_root) if src_parent and src_root else ""
-        except ValueError:
-            rel_path = ""
-
-        # 使用兼容性更好的写法判断路径
-        out_dir_base = output_root.strip()
-        if not out_dir_base or out_dir_base == "":
-            target_folder = src_parent or default_output_folder()
-        else:
-            target_folder = os.path.join(out_dir_base, rel_path)
+        target_folder = resolve_save_folder(src_parent, src_root, output_root)
 
         if not os.path.exists(target_folder):
             os.makedirs(target_folder, exist_ok=True)
@@ -454,7 +440,7 @@ class SourceInfoImageLoader:
             raise FileNotFoundError(f"Image not found: {image}")
 
         img_tensor, mask, icc = load_image_file(path)
-        source_info = {"filename": os.path.basename(path)}
+        source_info = make_source_info(path, self.resolve_root_path(image, path))
         return (img_tensor.unsqueeze(0), mask.unsqueeze(0), source_info, icc)
 
 
