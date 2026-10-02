@@ -7,6 +7,20 @@
 *   **LM Studio**：集成 **LM Studio** 的命令行工具 (`lms`)，支持本地文本聊天模型和视觉模型推理。
 *   **Batch Walker**：支持批量加载图片（列表模式或索引模式）、按原目录结构保存图片、以及保存对应的文本/JSON 数据
 *   **Seamless Patch**：用于修复无缝拼贴图案的节点组，包含十字蒙版生成和分割合并功能
+*   **send_to_eagle**：将图片、工作流和生成信息保存到 Eagle，自动标记实际使用的模型与 LoRA。
+*   **send_to_serpent**：用相同的图片保存和元数据规则导入 Serpent 资源库。
+
+## send_to_eagle
+
+搜索 `send_to_eagle`，连接唯一的 `image` 图片接口。选择 `png`、`jpg` 或 `webp`、压缩方式和质量百分比；`tags` 可用逗号或换行手动添加多个标签。PNG 和 WebP 支持真正无损，JPG 只能选 lossy。质量百分比只影响 JPG 和有损 WebP。
+
+节点按图片实际经过的采样链读取模型与 LoRA（多阶段会全部记录），把模型名和 LoRA 文件名添加为 Eagle 标签。Eagle 备注的第一行直接是正向提示词，后面依次是 `Negative prompt:`、`Model:` 和带强度的各条 `LORA:`。工作流会嵌进导出的图片；同时图片保留在 ComfyUI 的 `output/PPP_Eagle` 目录。Eagle 桌面程序需运行，本机 API 使用默认端口 41595，无需在节点中填写 token。动态生成的提示词如果没有作为文字出现在工作流中，可能无法自动还原。
+
+## send_to_serpent
+
+搜索 `send_to_serpent`，连接 `image`，并在 `library_id` 指定目标资源库的稳定 ID。格式、压缩、质量和 `tags` 与 Eagle 节点一致。生成说明写到 Serpent 描述，模型、LoRA 和手动标签写到 Serpent 标签。图片及工作流也保留在 ComfyUI 的 `output/PPP_Serpent` 目录。
+
+Serpent 桌面程序需运行并开启 MCP。把 Bearer token 设为 ComfyUI 进程的 `PPP_SERPENT_MCP_TOKEN` 环境变量；可将默认库 ID 设为 `PPP_SERPENT_LIBRARY_ID`。设置后重启 ComfyUI。token 不会保存在节点、工作流或仓库文件中。Serpent 描述最多 10000 字符，超过时节点会在导入前报错。
 
 ## LM Studio
 
