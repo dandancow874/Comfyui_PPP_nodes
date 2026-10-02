@@ -16,6 +16,8 @@
 
 节点按图片实际经过的采样链读取模型与 LoRA（多阶段会全部记录），把模型名和 LoRA 文件名添加为 Eagle 标签。Eagle 备注的第一行直接是正向提示词，后面依次是 `Negative prompt:`、`Model:` 和带强度的各条 `LORA:`。工作流会嵌进导出的图片；同时图片保留在 ComfyUI 的 `output/PPP_Eagle` 目录。Eagle 桌面程序需运行，本机 API 使用默认端口 41595，无需在节点中填写 token。动态生成的提示词如果没有作为文字出现在工作流中，可能无法自动还原。
 
+模型识别也支持 Fastuse 的 `fast imageInputV2` / `fast loaderV2` 工作流；WebP/JPG 中的中文工作流字段使用 JSON Unicode 转义保存，重新打开图片时可以正确还原。
+
 ## send_to_serpent
 
 搜索 `send_to_serpent`，连接 `image`，并在 `library_id` 指定目标资源库的稳定 ID。格式、压缩、质量和 `tags` 与 Eagle 节点一致。生成说明写到 Serpent 描述，模型、LoRA 和手动标签写到 Serpent 标签。图片及工作流也保留在 ComfyUI 的 `output/PPP_Serpent` 目录。

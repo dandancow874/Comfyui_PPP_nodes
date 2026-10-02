@@ -56,6 +56,7 @@ class SendToEagleTests(unittest.TestCase):
 
     def test_embeds_workflow_in_each_format(self):
         graph = sample_graph()
+        graph["13"]["inputs"]["value"] = "庭院里的女孩"
         image = Image.new("RGB", (8, 8), "red")
         with tempfile.TemporaryDirectory() as directory:
             for file_format in ("png", "jpg", "webp"):
@@ -69,6 +70,42 @@ class SendToEagleTests(unittest.TestCase):
                         exif = saved.getexif()
                         self.assertEqual(json.loads(exif[0x0110][7:]), graph)
                         self.assertEqual(json.loads(exif[0x010F][9:]), {"nodes": []})
+
+    def test_fastuse_generator_reads_its_loader(self):
+        graph = {
+            "3": {"class_type": "fast loaderV2", "inputs": {
+                "加载模式": "独立模型",
+                "加载模式.选择扩散模型": "qwen_image_2.1_int8_convrot.safetensors",
+                "加载模式.Clip数量.Clip模型1": "qwen3vl_8b_int8_convrot.safetensors",
+                "加载模式.选择VAE": "qwen_image_2.1_vae_bf16.safetensors",
+            }},
+            "23": {"class_type": "fast imageInputV2", "inputs": {
+                "模型加载器": ["3", 0], "正面提示词": "一朵花", "负面提示词": "模糊",
+            }},
+            "8": {"class_type": "fast outputResult", "inputs": {"采样": ["23", 0]}},
+            "31": {"class_type": "send_to_eagle", "inputs": {"image": ["8", 0]}},
+        }
+        info = extract_generation_info(graph, "31")
+        self.assertEqual(info["models"], ["qwen_image_2.1_int8_convrot.safetensors"])
+        self.assertEqual(info["positive"], "一朵花")
+        self.assertEqual(info["negative"], "模糊")
+
+    def test_fastuse_loader_in_older_webp_metadata(self):
+        graph = {
+            "3": {"class_type": "fast loaderV2", "inputs": {
+                "????": "????",
+                "????.??????": "qwen_image_2.1_int8_convrot.safetensors",
+                "????.Clip??.Clip??1": "qwen3vl_8b_int8_convrot.safetensors",
+                "????.??VAE": "qwen_image_2.1_vae_bf16.safetensors",
+            }},
+            "23": {"class_type": "fast imageInputV2", "inputs": {"?????": ["3", 0]}},
+            "8": {"class_type": "fast outputResult", "inputs": {"??": ["23", 0]}},
+            "31": {"class_type": "send_to_eagle", "inputs": {"image": ["8", 0]}},
+        }
+        self.assertEqual(
+            extract_generation_info(graph, "31")["models"],
+            ["qwen_image_2.1_int8_convrot.safetensors"],
+        )
 
     def test_send_passes_annotation_and_tags_to_eagle(self):
         graph = sample_graph()

@@ -14,6 +14,11 @@ from PIL import Image, PngImagePlugin
 logger = logging.getLogger(__name__)
 EAGLE_ADD_URL = "http://127.0.0.1:41595/api/item/addFromPath"
 MODEL_FIELDS = ("ckpt_name", "unet_name", "model_name", "diffusion_model_name")
+FAST_LOADER_MODEL_FIELDS = {
+    "检查点模型": ("选择检查点",),
+    "独立模型": ("选择扩散模型",),
+    "融合模型": ("选择主模型", "选择覆盖模型"),
+}
 
 
 def _node(graph, node_id):
@@ -93,6 +98,23 @@ def _lora_entries(inputs):
                     yield item["lora"], item.get("strength", item.get("strength_model", 1)), item.get("strength_clip")
 
 
+def _fast_loader_models(inputs):
+    fields = FAST_LOADER_MODEL_FIELDS.get(inputs.get("加载模式"))
+    if fields:
+        for field in fields:
+            for key, value in inputs.items():
+                if (key == field or key.endswith("." + field)) and isinstance(value, str) and value.lower() != "none":
+                    yield _basename(value)
+        return
+
+    # Older WebP exports replaced Chinese EXIF text with '?'. In this node's
+    # serialized input order, the first model file is the selected base model.
+    for value in inputs.values():
+        if isinstance(value, str) and value.lower().endswith((".safetensors", ".ckpt", ".gguf")):
+            yield _basename(value)
+            return
+
+
 def _model_chain(graph, start):
     queue = deque([str(start)])
     seen = set()
@@ -105,6 +127,8 @@ def _model_chain(graph, start):
         seen.add(node_id)
         node = _node(graph, node_id)
         inputs = node.get("inputs", {})
+        if node.get("class_type") == "fast loaderV2":
+            models.extend(_fast_loader_models(inputs))
         for key in MODEL_FIELDS:
             if isinstance(inputs.get(key), str):
                 models.append(_basename(inputs[key]))
@@ -128,8 +152,9 @@ def extract_generation_info(graph, node_id):
     if not image_source:
         return {"positive": "", "negative": "", "models": [], "loras": []}
 
+    ancestors = list(_upstream(graph, image_source))
     samplers = []
-    for sid, node, distance in _upstream(graph, image_source):
+    for sid, node, distance in ancestors:
         kind = node.get("class_type", "").lower()
         inputs = node.get("inputs", {})
         if "sampler" in kind and "model" in inputs and ("positive" in inputs or "latent_image" in inputs):
@@ -151,6 +176,29 @@ def extract_generation_info(graph, node_id):
             for lora in stage_loras:
                 if lora not in loras:
                     loras.append(lora)
+
+    for _, node, _ in ancestors:
+        if node.get("class_type") == "fast imageInputV2":
+            inputs = node.get("inputs", {})
+            positive = positive or _text_value(graph, inputs.get("正面提示词"))
+            negative = negative or _text_value(graph, inputs.get("负面提示词"))
+
+    if not models:
+        for sid, node, _ in ancestors:
+            inputs = node.get("inputs", {})
+            if node.get("class_type") == "fast loaderV2" or any(key in inputs for key in MODEL_FIELDS):
+                stage_models, stage_loras = _model_chain(graph, sid)
+                for model in stage_models:
+                    if model not in models:
+                        models.append(model)
+                for lora in stage_loras:
+                    if lora not in loras:
+                        loras.append(lora)
+            else:
+                for lora in _lora_entries(inputs):
+                    normalized = (_basename(lora[0]), lora[1], lora[2])
+                    if normalized not in loras:
+                        loras.append(normalized)
     return {"positive": positive, "negative": negative, "models": models, "loras": loras}
 
 
@@ -185,7 +233,7 @@ def _save_image(image, path, file_format, compression_mode, quality, prompt, ext
     metadata = {"prompt": prompt}
     if isinstance(extra_pnginfo, dict):
         metadata.update(extra_pnginfo)
-    metadata = {key: json.dumps(value, ensure_ascii=False) for key, value in metadata.items() if value is not None}
+    metadata = {key: json.dumps(value, ensure_ascii=True) for key, value in metadata.items() if value is not None}
 
     if file_format == "png":
         pnginfo = PngImagePlugin.PngInfo()
