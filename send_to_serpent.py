@@ -171,7 +171,7 @@ class PPPSendToSerpent:
                 "quality": ("INT", {"default": 95, "min": 1, "max": 100, "step": 1}),
                 "tags": ("STRING", {"default": "", "multiline": True}),
             },
-            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"},
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID", "execution_list": "EXECUTION_LIST"},
         }
 
     RETURN_TYPES = ()
@@ -180,7 +180,7 @@ class PPPSendToSerpent:
     CATEGORY = "PPP Nodes/Serpent"
 
     def send(self, image, library_id, file_format, compression_mode, quality, tags,
-             prompt=None, extra_pnginfo=None, unique_id=None):
+             prompt=None, extra_pnginfo=None, unique_id=None, execution_list=None):
         import folder_paths
 
         token = _setting("PPP_SERPENT_MCP_TOKEN").strip()
@@ -193,7 +193,7 @@ class PPPSendToSerpent:
         if file_format == "jpg" and compression_mode == "lossless":
             raise ValueError("JPEG does not support lossless compression. Choose PNG/WEBP or switch to lossy.")
 
-        info = extract_generation_info(prompt, unique_id)
+        info = extract_generation_info(prompt, unique_id, execution_list)
         annotation = build_annotation(info)
         if len(annotation) > 10000:
             raise ValueError("Serpent description limit is 10000 characters; this prompt is longer")

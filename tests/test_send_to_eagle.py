@@ -30,6 +30,20 @@ def sample_graph():
     }
 
 
+def dynamic_prompt_graph():
+    return {
+        "1": {"class_type": "Gemma4TE_ImageInfer", "inputs": {"提示词": ""}},
+        "2": {"class_type": "ShowText|pysssss", "inputs": {"text": ["1", 0], "text_0": "上一次的提示词"}},
+        "3": {"class_type": "fast prompts", "inputs": {"提示词": "另一条未选中的提示词"}},
+        "4": {"class_type": "Any Switch (rgthree)", "inputs": {"any_01": ["2", 0], "any_03": ["3", 0]}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": ["4", 0]}},
+        "6": {"class_type": "UNETLoader", "inputs": {"unet_name": "image-model.safetensors"}},
+        "7": {"class_type": "KSampler", "inputs": {"model": ["6", 0], "positive": ["5", 0]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0]}},
+        "9": {"class_type": "send_to_eagle", "inputs": {"image": ["8", 0]}},
+    }
+
+
 class FakeTensor:
     def cpu(self):
         return self
@@ -106,6 +120,29 @@ class SendToEagleTests(unittest.TestCase):
             extract_generation_info(graph, "31")["models"],
             ["qwen_image_2.1_int8_convrot.safetensors"],
         )
+
+    def test_dynamic_prompt_uses_connected_runtime_text(self):
+        graph = dynamic_prompt_graph()
+        entry = types.SimpleNamespace(outputs=[["這是一個從極低角度仰視的近景鏡頭"]])
+        cache = types.SimpleNamespace(get_local=lambda node_id: entry if node_id == "4" else None)
+        execution_list = types.SimpleNamespace(output_cache=cache)
+        self.assertEqual(extract_generation_info(graph, "9")["positive"], "")
+        info = extract_generation_info(graph, "9", execution_list)
+        self.assertEqual(info["positive"], "這是一個從極低角度仰視的近景鏡頭")
+        self.assertEqual(info["models"], ["image-model.safetensors"])
+
+    def test_send_passes_runtime_prompt_to_eagle(self):
+        output = tempfile.TemporaryDirectory()
+        self.addCleanup(output.cleanup)
+        entry = types.SimpleNamespace(outputs=[["本次生成的提示词"]])
+        cache = types.SimpleNamespace(get_local=lambda node_id: entry if node_id == "4" else None)
+        execution_list = types.SimpleNamespace(output_cache=cache)
+        fake_folder_paths = types.SimpleNamespace(get_output_directory=lambda: output.name)
+        response = types.SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": "success"})
+        with patch.dict(sys.modules, {"folder_paths": fake_folder_paths}), patch("send_to_eagle.requests.post", return_value=response) as post:
+            PPPSendToEagle().send(FakeBatch([FakeTensor()]), "webp", "lossless", 95, "", prompt=dynamic_prompt_graph(), unique_id="9", execution_list=execution_list)
+        self.assertTrue(post.call_args.kwargs["json"]["annotation"].startswith("本次生成的提示词\n"))
+        self.assertEqual(PPPSendToEagle.INPUT_TYPES()["hidden"]["execution_list"], "EXECUTION_LIST")
 
     def test_send_passes_annotation_and_tags_to_eagle(self):
         graph = sample_graph()

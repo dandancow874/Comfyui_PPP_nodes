@@ -1,13 +1,18 @@
 import os
 import sys
+import tempfile
 import types
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 
 package = types.ModuleType("ppp_test_package")
 package.__path__ = [os.path.dirname(os.path.dirname(__file__))]
 sys.modules.setdefault("ppp_test_package", package)
-from ppp_test_package.send_to_serpent import _tag_ids, add_to_serpent
+from ppp_test_package import send_to_serpent
+from ppp_test_package.send_to_serpent import PPPSendToSerpent, _tag_ids, add_to_serpent
 
 
 class FakeClient:
@@ -30,6 +35,40 @@ class FakeClient:
 
 
 class SendToSerpentTests(unittest.TestCase):
+    def test_runtime_execution_list_is_hidden(self):
+        self.assertEqual(PPPSendToSerpent.INPUT_TYPES()["hidden"]["execution_list"], "EXECUTION_LIST")
+
+    def test_send_passes_runtime_prompt_to_serpent(self):
+        graph = {
+            "1": {"class_type": "TextNode", "inputs": {"text": "上一次的提示词"}},
+            "2": {"class_type": "fast imageInputV2", "inputs": {"正面提示词": ["1", 0]}},
+            "3": {"class_type": "send_to_serpent", "inputs": {"image": ["2", 0]}},
+        }
+        entry = types.SimpleNamespace(outputs=[["本次生成的提示词"]])
+        cache = types.SimpleNamespace(get_local=lambda node_id: entry if node_id == "1" else None)
+        execution_list = types.SimpleNamespace(output_cache=cache)
+        fake_folder_paths = types.SimpleNamespace(get_output_directory=lambda: output)
+
+        class FakeTensor:
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return np.ones((8, 8, 3))
+
+        class FakeBatch(list):
+            @property
+            def shape(self):
+                return (len(self), 8, 8, 3)
+
+        with tempfile.TemporaryDirectory() as output:
+            with patch.dict(sys.modules, {"folder_paths": fake_folder_paths}), \
+                 patch.object(send_to_serpent, "_setting", return_value="test-token"), \
+                 patch.object(send_to_serpent, "SerpentMCP"), \
+                 patch.object(send_to_serpent, "add_to_serpent", return_value="asset-1") as add:
+                PPPSendToSerpent().send(FakeBatch([FakeTensor()]), "library-1", "webp", "lossless", 95, "", prompt=graph, unique_id="3", execution_list=execution_list)
+        self.assertTrue(add.call_args.args[3].startswith("本次生成的提示词\n"))
+
     def test_import_uses_explicit_library_and_sets_metadata_and_tags(self):
         client = FakeClient()
         asset = add_to_serpent(client, "library-1", r"C:\output\image.webp", "prompt\nModel: final", ["existing", "new"])

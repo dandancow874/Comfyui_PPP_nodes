@@ -47,12 +47,30 @@ def _upstream(graph, start):
                 queue.append((linked, distance + 1))
 
 
-def _text_value(graph, value, seen=None):
+def _cached_text(execution_list, node_id, output_index):
+    # The serialized prompt has links, while the execution cache has the text actually used by this run.
+    cache = getattr(getattr(execution_list, "output_cache", None), "get_local", None)
+    if not callable(cache):
+        return ""
+    entry = cache(node_id)
+    outputs = getattr(entry, "outputs", None)
+    if not isinstance(outputs, (list, tuple)) or output_index < 0 or output_index >= len(outputs):
+        return ""
+    values = outputs[output_index]
+    if not isinstance(values, (list, tuple)):
+        values = (values,)
+    return next((value.strip() for value in values if isinstance(value, str) and value.strip()), "")
+
+
+def _text_value(graph, value, seen=None, execution_list=None):
     if isinstance(value, str):
         return value.strip()
     linked = _link(value, graph)
     if not linked:
         return ""
+    runtime_text = _cached_text(execution_list, linked, value[1])
+    if runtime_text:
+        return runtime_text
     seen = set() if seen is None else seen
     if linked in seen:
         return ""
@@ -61,13 +79,13 @@ def _text_value(graph, value, seen=None):
     inputs = node.get("inputs", {})
     for key in ("text", "value", "string", "prompt", "positive", "negative", "提示词"):
         if key in inputs:
-            result = _text_value(graph, inputs[key], seen)
+            result = _text_value(graph, inputs[key], seen, execution_list)
             if result:
                 return result
     return ""
 
 
-def _prompt_from_conditioning(graph, value):
+def _prompt_from_conditioning(graph, value, execution_list=None):
     linked = _link(value, graph)
     if not linked:
         return ""
@@ -76,7 +94,7 @@ def _prompt_from_conditioning(graph, value):
         if "zeroout" in kind or "zero_out" in kind:
             return ""
         if "textencode" in kind or "text_encode" in kind:
-            text = _text_value(graph, node.get("inputs", {}).get("text"))
+            text = _text_value(graph, node.get("inputs", {}).get("text"), execution_list=execution_list)
             if text:
                 return text
     return ""
@@ -143,7 +161,7 @@ def _model_chain(graph, start):
     return models, loras
 
 
-def extract_generation_info(graph, node_id):
+def extract_generation_info(graph, node_id, execution_list=None):
     """Follow the image feeding this save node, then each sampler's actual model input."""
     if not isinstance(graph, dict):
         return {"positive": "", "negative": "", "models": [], "loras": []}
@@ -165,8 +183,8 @@ def extract_generation_info(graph, node_id):
     positive, negative = "", ""
     for _, _, sampler in samplers:
         inputs = sampler["inputs"]
-        positive = positive or _prompt_from_conditioning(graph, inputs.get("positive"))
-        negative = negative or _prompt_from_conditioning(graph, inputs.get("negative"))
+        positive = positive or _prompt_from_conditioning(graph, inputs.get("positive"), execution_list)
+        negative = negative or _prompt_from_conditioning(graph, inputs.get("negative"), execution_list)
         source = _link(inputs.get("model"), graph)
         if source:
             stage_models, stage_loras = _model_chain(graph, source)
@@ -180,8 +198,8 @@ def extract_generation_info(graph, node_id):
     for _, node, _ in ancestors:
         if node.get("class_type") == "fast imageInputV2":
             inputs = node.get("inputs", {})
-            positive = positive or _text_value(graph, inputs.get("正面提示词"))
-            negative = negative or _text_value(graph, inputs.get("负面提示词"))
+            positive = positive or _text_value(graph, inputs.get("正面提示词"), execution_list=execution_list)
+            negative = negative or _text_value(graph, inputs.get("负面提示词"), execution_list=execution_list)
 
     if not models:
         for sid, node, _ in ancestors:
@@ -265,7 +283,7 @@ class PPPSendToEagle:
                 "quality": ("INT", {"default": 95, "min": 1, "max": 100, "step": 1}),
                 "tags": ("STRING", {"default": "", "multiline": True}),
             },
-            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"},
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID", "execution_list": "EXECUTION_LIST"},
         }
 
     RETURN_TYPES = ()
@@ -273,7 +291,7 @@ class PPPSendToEagle:
     OUTPUT_NODE = True
     CATEGORY = "PPP Nodes/Eagle"
 
-    def send(self, image, file_format, compression_mode, quality, tags, prompt=None, extra_pnginfo=None, unique_id=None):
+    def send(self, image, file_format, compression_mode, quality, tags, prompt=None, extra_pnginfo=None, unique_id=None, execution_list=None):
         import folder_paths
 
         if image.shape[0] == 0:
@@ -281,7 +299,7 @@ class PPPSendToEagle:
         if file_format == "jpg" and compression_mode == "lossless":
             raise ValueError("JPEG does not support lossless compression. Choose PNG/WEBP or switch to lossy.")
 
-        info = extract_generation_info(prompt, unique_id)
+        info = extract_generation_info(prompt, unique_id, execution_list)
         annotation = build_annotation(info)
         eagle_tags = build_tags(info, tags)
         output_dir = os.path.join(folder_paths.get_output_directory(), "PPP_Eagle")
